@@ -4,7 +4,7 @@
  * Shows: Great Wave graphic | Next 4 tide times (H/L) | Current temp & feels-like
  * Location: Hilton Head Island, SC 29928  (NOAA Station 8665530)
  * Temperature + Feels-like: NWS KHXD (Hilton Head Airport) — real observed data
- * Rain chance + weather code: Open-Meteo
+ * Rain chance + weather code: NWS gridpoint hourly forecast
  */
 
 #include <WiFi.h>
@@ -13,9 +13,12 @@
 #include <TFT_eSPI.h>
 #include <time.h>
 #include <WiFiClientSecure.h>
+#include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+#include <PNGdec.h>
 #include "wave_img.h"
 #include "weather_icons.h"
+#include "basemap_img.h"
 
 // ── WiFi ──────────────────────────────────────────────────────────────────────
 const char* SSID     = "Dexter5G";
@@ -32,30 +35,69 @@ const char* NOAA_STATION = "8665530";
 // ── NWS observed data: Hilton Head Airport (KHXD) ────────────────────────────
 const char* NWS_URL = "https://api.weather.gov/stations/KHXD/observations/latest";
 
-// ── Open-Meteo: rain chance + weather code only ───────────────────────────────
-const char* WEATHER_URL =
-  "https://api.open-meteo.com/v1/forecast"
-  "?latitude=32.2163&longitude=-80.7526"
-  "&current=weather_code"
-  "&hourly=precipitation_probability"
-  "&timezone=America%2FNew_York"
-  "&forecast_days=1";
+// ── NWS gridpoint: rain chance + weather code (resolved once at boot) ────────
+const float LOCATION_LAT     = 32.2163;
+const float LOCATION_LON     = -80.7526;
+const char* NWS_USER_AGENT   = "(TideDisplay, johnvv999@example.com)";
+
+String rainForecastUrl = "";  // properties.forecastHourly from /points lookup
 
 // ── Refresh intervals ─────────────────────────────────────────────────────────
 const unsigned long TIDE_REFRESH_MS    = 6UL * 3600UL * 1000UL;
+const unsigned long TIDE_RETRY_MS      = 10UL * 60UL * 1000UL;   // retry sooner after a failed tide fetch
 const unsigned long WEATHER_REFRESH_MS = 10UL * 60UL * 1000UL;
 
 // ── Display ───────────────────────────────────────────────────────────────────
 TFT_eSPI tft = TFT_eSPI();
 
 // ── Touch & sleep ─────────────────────────────────────────────────────────────
-#define TOUCH_CS_PIN  33
-#define BACKLIGHT_PIN 27
-#define SLEEP_MS      600000UL
+#define TOUCH_CS_PIN   33
+#define TOUCH_IRQ_PIN  36
+#define TOUCH_CLK_PIN  14   // shared with TFT HSPI bus
+#define TOUCH_MOSI_PIN 13   // shared with TFT HSPI bus
+#define TOUCH_MISO_PIN 12   // shared with TFT HSPI bus
+#define BACKLIGHT_PIN  27
+#define SLEEP_MS       600000UL
 
-XPT2046_Touchscreen touch(TOUCH_CS_PIN);
+SPIClass touchSPI(HSPI);
+XPT2046_Touchscreen touch(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
 bool screenOn = true;
 unsigned long lastTouchMs = 0;
+unsigned long lastSleepCountdownMs = 0;
+
+// ── Double-tap detection ──────────────────────────────────────────────────────
+bool touchWasDown = false;
+unsigned long lastTapMs = 0;
+const unsigned long DOUBLE_TAP_WINDOW_MS = 800;
+const unsigned long MIN_TAP_GAP_MS       = 100;  // filters mechanical contact bounce
+const int TOUCH_Z_THRESHOLD              = 150;  // lower = lighter touches register; raise if too sensitive
+
+// ── Radar overlay mode ────────────────────────────────────────────────────────
+bool radarMode = false;
+unsigned long radarStartMs = 0;
+const unsigned long RADAR_DURATION_MS = 60UL * 1000UL;
+
+// NOAA's GeoServer WMS — lets us request an exact lat/lon bounding box rendered
+// at our exact pixel size, at full native "Super Resolution" radar data, instead
+// of cropping/zooming a fixed pre-made image. KCLX = Charleston, SC radar, which
+// covers Hilton Head. No basemap/roads/labels come with this — just radar data —
+// so we draw a simple crosshair marking your exact location for reference.
+// Quality-controlled composite reflectivity — unlike the raw per-station "sr_bref"
+// layer, this has ground clutter, sea clutter, and non-precipitation echoes filtered
+// out by NOAA's MRMS system (important this close to the coast/marsh). It's a national
+// mosaic, but WMS still lets us request just our small bbox at full native resolution.
+const char* RADAR_WMS_HOST  = "https://opengeo.ncep.noaa.gov/geoserver/conus/ows";
+const char* RADAR_WMS_LAYER = "conus_bref_qcd";
+
+// (Basemap is now a static image baked into firmware — see basemap_img.h — rather
+// than fetched from NOAA's reference map service, to avoid anti-aliasing speckle
+// on this small a display.)
+
+// Vertical half-extent of the view, in miles. Total view height = 2x this value;
+// width is derived to match the screen's aspect ratio. Lower = more zoomed in.
+const float RADAR_RADIUS_MI = 12.0f;
+
+PNG png;
 
 const int DIVIDER_X = 205;
 const int WAVE_X    = 0;
@@ -80,6 +122,7 @@ struct TideEvent {
 
 TideEvent tides[4];
 int   tideCount       = 0;
+bool  tidesValid       = false;
 float currentTemp     = 0.0f;
 float feelsLikeTemp   = 0.0f;
 int   weatherCode     = 0;
@@ -140,6 +183,34 @@ void parseNoaaTime(const char* iso, char* timeOut, char* dateOut) {
 
 
 
+// ── Resolve NWS gridpoint forecastHourly URL (call once; cache result) ───────
+bool resolveGridpoint() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient https;
+  char url[80];
+  snprintf(url, sizeof(url), "https://api.weather.gov/points/%.4f,%.4f", LOCATION_LAT, LOCATION_LON);
+  https.begin(client, url);
+  https.addHeader("User-Agent", NWS_USER_AGENT);
+  https.setTimeout(20000);
+  int code = https.GET();
+  if (code != 200) {
+    Serial.printf("Gridpoint lookup failed: %d\n", code);
+    https.end();
+    return false;
+  }
+  DynamicJsonDocument doc(2048);
+  DeserializationError err = deserializeJson(doc, https.getStream());
+  https.end();
+  if (err) {
+    Serial.printf("Gridpoint JSON parse error: %s\n", err.c_str());
+    return false;
+  }
+  rainForecastUrl = doc["properties"]["forecastHourly"].as<String>();
+  Serial.printf("Resolved forecastHourly URL: %s\n", rainForecastUrl.c_str());
+  return rainForecastUrl.length() > 0;
+}
+
 // ── Fetch tides ───────────────────────────────────────────────────────────────
 void fetchTides() {
   time_t now = time(nullptr);
@@ -152,44 +223,62 @@ void fetchTides() {
   localtime_r(&future, &ti2);
   strftime(endDate, sizeof(endDate), "%Y%m%d", &ti2);
 
-  Serial.printf("Tide fetch: begin=%s end=%s\n", beginDate, endDate);
-
-  WiFiClientSecure secClient;
-  secClient.setInsecure();
-  HTTPClient http;
   String url = String("https://api.tidesandcurrents.noaa.gov/api/prod/datagetter") +
     "?begin_date=" + beginDate + "&end_date=" + endDate +
     "&station=" + NOAA_STATION +
     "&product=predictions&datum=MLLW&time_zone=lst_ldt"
     "&interval=hilo&units=english&application=tide_display&format=json";
   Serial.printf("Tide URL: %s\n", url.c_str());
-  http.begin(secClient, url);
-  http.setTimeout(20000);
-  int code = http.GET();
-  Serial.printf("Tide HTTP code: %d\n", code);
-  if (code != 200) { http.end(); return; }
-  String body = http.getString();
-  Serial.printf("Tide body (%d bytes): %.200s\n", body.length(), body.c_str());
-  http.end();
 
-  DynamicJsonDocument doc(8192);
-  DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    Serial.printf("Tide JSON parse error: %s\n", err.c_str());
-    return;
+  const int MAX_ATTEMPTS = 3;
+  const unsigned long RETRY_DELAY_MS[MAX_ATTEMPTS] = {0, 5000, 15000};  // wait before attempts 2 and 3
+  bool success = false;
+
+  for (int attempt = 1; attempt <= MAX_ATTEMPTS && !success; attempt++) {
+    if (RETRY_DELAY_MS[attempt - 1] > 0) {
+      Serial.printf("Retrying tide fetch in %lus...\n", RETRY_DELAY_MS[attempt - 1] / 1000);
+      delay(RETRY_DELAY_MS[attempt - 1]);
+    }
+
+    WiFiClientSecure secClient;
+    secClient.setInsecure();
+    HTTPClient http;
+    http.begin(secClient, url);
+    http.setTimeout(45000);  // NOAA can be slow under load — give it real time before giving up
+    int code = http.GET();
+    Serial.printf("Tide fetch attempt %d/%d: HTTP code %d\n", attempt, MAX_ATTEMPTS, code);
+
+    if (code == 200) {
+      String body = http.getString();
+      http.end();
+
+      DynamicJsonDocument doc(8192);
+      DeserializationError err = deserializeJson(doc, body);
+      if (err) {
+        Serial.printf("Tide JSON parse error: %s\n", err.c_str());
+        continue;  // treat as a failed attempt, try again
+      }
+
+      JsonArray predictions = doc["predictions"].as<JsonArray>();
+      tideCount = 0;
+      for (JsonObject p : predictions) {
+        if (tideCount >= 4) break;
+        parseNoaaTime(p["t"], tides[tideCount].time, tides[tideCount].date);
+        tides[tideCount].isHigh = (p["type"].as<const char*>()[0] == 'H');
+        tideCount++;
+      }
+      Serial.printf("Fetched %d tides\n", tideCount);
+      success = true;
+    } else {
+      http.end();
+    }
   }
 
-  JsonArray predictions = doc["predictions"].as<JsonArray>();
-  Serial.printf("Predictions array size: %d\n", predictions.size());
-  tideCount = 0;
-  for (JsonObject p : predictions) {
-    if (tideCount >= 4) break;
-    parseNoaaTime(p["t"], tides[tideCount].time, tides[tideCount].date);
-    tides[tideCount].isHigh = (p["type"].as<const char*>()[0] == 'H');
-    tideCount++;
+  tidesValid    = success;
+  lastTideFetch = millis();  // mark the attempt either way, so retries are spaced out, not spammed
+  if (!success) {
+    Serial.println("Tide fetch failed after retries — will retry in 10 minutes instead of waiting 6h.");
   }
-  Serial.printf("Fetched %d tides\n", tideCount);
-  lastTideFetch = millis();
 }
 
 
@@ -244,43 +333,77 @@ void fetchWeather() {
     nwsHttp.end();
   }
 
-  // --- Open-Meteo: rain chance + weather code only ---
+  // --- NWS gridpoint hourly forecast: rain chance + conditions ---
   {
-    WiFiClientSecure omClient;
-    omClient.setInsecure();
-    HTTPClient omHttp;
-    omHttp.begin(omClient, WEATHER_URL);
-    omHttp.setTimeout(20000);
-    int code = omHttp.GET();
-    if (code != 200) {
-      Serial.printf("Open-Meteo HTTP error: %d\n", code);
-      omHttp.end();
-      if (currentTemp != 0.0f) weatherValid = true;
-      lastWeatherFetch = millis();
-      return;
-    }
-    String body = omHttp.getString();
-    omHttp.end();
-
-    DynamicJsonDocument doc(2048);
-    if (deserializeJson(doc, body)) {
-      Serial.println("Open-Meteo JSON parse failed");
-      if (currentTemp != 0.0f) weatherValid = true;
-      lastWeatherFetch = millis();
-      return;
+    if (rainForecastUrl.length() == 0) {
+      resolveGridpoint();
     }
 
-    rainChance = doc["hourly"]["precipitation_probability"][0].as<int>();
+    if (rainForecastUrl.length() > 0) {
+      WiFiClientSecure gpClient;
+      gpClient.setInsecure();
+      HTTPClient gpHttp;
+      gpHttp.begin(gpClient, rainForecastUrl);
+      gpHttp.setTimeout(20000);
+      gpHttp.addHeader("User-Agent", NWS_USER_AGENT);
+      gpHttp.addHeader("Accept", "application/geo+json");
+      int code = gpHttp.GET();
 
-    int newCode = doc["current"]["weather_code"].as<int>();
-    if (newCode <= 3 || rainChance > 50) {
-      weatherCode     = newCode;
-      lastWeatherCode = newCode;
-    } else {
-      weatherCode = lastWeatherCode;
+      if (code == 200) {
+        // Only keep the fields we need from periods[0] — keeps the doc small
+        StaticJsonDocument<128> filter;
+        filter["properties"]["periods"][0]["probabilityOfPrecipitation"] = true;
+        filter["properties"]["periods"][0]["shortForecast"] = true;
+
+        DynamicJsonDocument doc(16384);
+        DeserializationError err = deserializeJson(doc, gpHttp.getStream(),
+                                                     DeserializationOption::Filter(filter));
+        if (!err) {
+          JsonVariant pop = doc["properties"]["periods"][0]["probabilityOfPrecipitation"]["value"];
+          rainChance = pop.is<int>() ? pop.as<int>() : 0;
+
+          String shortFc = doc["properties"]["periods"][0]["shortForecast"].as<String>();
+          shortFc.toLowerCase();
+
+          int newCode;
+          if (shortFc.indexOf("thunder") >= 0) {
+            newCode = 95;
+          } else if (shortFc.indexOf("rain") >= 0 || shortFc.indexOf("shower") >= 0 ||
+                     shortFc.indexOf("drizzle") >= 0) {
+            newCode = 61;
+          } else if (shortFc.indexOf("fog") >= 0 || shortFc.indexOf("mist") >= 0 ||
+                     shortFc.indexOf("haze") >= 0) {
+            newCode = 45;
+          } else if (shortFc.indexOf("cloud") >= 0 || shortFc.indexOf("overcast") >= 0) {
+            newCode = 2;
+          } else {
+            newCode = 0;  // clear / sunny / mostly sunny
+          }
+
+          if (newCode <= 3 || rainChance > 50) {
+            weatherCode     = newCode;
+            lastWeatherCode = newCode;
+          } else {
+            weatherCode = lastWeatherCode;
+          }
+
+          Serial.printf("NWS rain=%d%%  forecast=\"%s\"  code=%d\n",
+                        rainChance, shortFc.c_str(), weatherCode);
+        } else {
+          Serial.printf("NWS gridpoint JSON parse failed: %s\n", err.c_str());
+        }
+      } else {
+        Serial.printf("NWS gridpoint HTTP error: %d\n", code);
+        if (code == 301 || code == 404) {
+          // grid mapping may have shifted — force a re-lookup next cycle
+          rainForecastUrl = "";
+        }
+      }
+      gpHttp.end();
     }
 
-    Serial.printf("Open-Meteo rain=%d%%  code=%d\n", rainChance, weatherCode);
+    if (currentTemp != 0.0f) weatherValid = true;
+    lastWeatherFetch = millis();
   }
 
   weatherValid     = true;
@@ -346,8 +469,7 @@ void drawWeather() {
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(COL_WHITE, COL_BG);
   tft.setTextSize(1);
-  tft.drawString("WEATHER", cx, 4);
-  tft.drawString("HHI", cx, 14);
+  tft.drawString("HHI", cx, 6);
 
   if (!weatherValid) {
     tft.drawString("...", cx, 80);
@@ -359,34 +481,200 @@ void drawWeather() {
   snprintf(buf, sizeof(buf), "%d F", (int)roundf(currentTemp));
   tft.setTextColor(COL_WHITE, COL_BG);
   tft.setTextSize(3);
-  tft.drawString(buf, cx, 30);
-
- // tft.drawFastHLine(wx, 60, ww, COL_DIVIDER);
+  tft.drawString(buf, cx, 20);
 
   tft.setTextColor(COL_WHITE, COL_BG);
   tft.setTextSize(1);
-  tft.drawString("Feels Like", cx, 65);
+  tft.drawString("Feels Like", cx, 52);
 
   snprintf(buf, sizeof(buf), "%d F", (int)roundf(feelsLikeTemp));
   tft.setTextColor(COL_FEELS, COL_BG);
   tft.setTextSize(2);
-  tft.drawString(buf, cx, 78);
+  tft.drawString(buf, cx, 64);
 
-  //tft.drawFastHLine(wx, 100, ww, COL_DIVIDER);
-
+  int iconAreaY = 86;          // gives feels-like text (ends ~y=80) clear room above
+  int iconAreaH = 98;
   int iconX = cx - WEATHER_ICON_W / 2;
-  int iconY = 102 + (126 - WEATHER_ICON_H) / 2;
-  tft.fillRect(wx, 102, ww, 126, COL_BG);
+  int iconY = iconAreaY + (iconAreaH - WEATHER_ICON_H) / 2;
+  tft.fillRect(wx, iconAreaY, ww, iconAreaH, COL_BG);
   tft.setSwapBytes(false);
   tft.pushImage(iconX, iconY, WEATHER_ICON_W, WEATHER_ICON_H,
                 (uint16_t*)getWeatherIcon(weatherCode), WEATHER_ICON_TRANSP);
   tft.setSwapBytes(true);
 
-  snprintf(buf, sizeof(buf), "Rain: %d%%", rainChance);
+  int rainAreaY = iconAreaY + iconAreaH;
+  tft.fillRect(wx, rainAreaY, ww, SCREEN_H - rainAreaY, COL_BG);
+
   tft.setTextColor(0x07FF, COL_BG);
-  tft.setTextSize(1);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString(buf, cx, 228);
+  tft.setTextSize(2);
+  tft.drawString("Rain", cx, rainAreaY + 4);
+
+  snprintf(buf, sizeof(buf), "%d%%", rainChance);
+  tft.setTextSize(3);
+  tft.drawString(buf, cx, rainAreaY + 22);
+}
+
+// ── Radar overlay: static basemap image, then live radar data drawn on top ──
+// Drawn ON TOP of the basemap — skip any pixel that came out as pure background
+// color (i.e. "no radar echo here") so the basemap underneath stays visible.
+int radarPngDraw(PNGDRAW *pDraw) {
+  uint16_t lineBuf[SCREEN_W];
+  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_BIG_ENDIAN, 0x00000000);
+
+  int x = 0;
+  while (x < SCREEN_W) {
+    if (lineBuf[x] == COL_BG) { x++; continue; }
+    int runStart = x;
+    while (x < SCREEN_W && lineBuf[x] != COL_BG) x++;
+    tft.pushImage(runStart, pDraw->y, x - runStart, 1, &lineBuf[runStart]);
+  }
+  return 1;
+}
+
+// Downloads a PNG from `url` into a newly-malloc'd buffer. Handles both a known
+// Content-Length and chunked/unknown-length responses. Caller must free() *outBuf
+// on success. Returns true on success.
+bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("User-Agent", NWS_USER_AGENT);
+  http.useHTTP10(true);  // server closes after response — simplifies reading chunked data
+  http.setTimeout(20000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("HTTP error %d: %s\n", code, url.c_str());
+    http.end();
+    return false;
+  }
+
+  int len = http.getSize();
+  bool knownLength = (len > 0);
+  if (knownLength && len > 250000) {
+    Serial.printf("Response too large: %d\n", len);
+    http.end();
+    return false;
+  }
+
+  const int MAX_BYTES = 65000;  // buffer cap when length is unknown (chunked encoding)
+  int bufCap = knownLength ? len : MAX_BYTES;
+
+  Serial.printf("Heap before malloc: free=%u, largest block=%u, requesting=%d\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap(), bufCap);
+
+  uint8_t *buf = (uint8_t*)malloc(bufCap);
+  if (!buf) {
+    Serial.println("malloc failed");
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  int received = 0;
+  unsigned long readStart = millis();
+  while (millis() - readStart < 20000) {
+    if (knownLength && received >= len) break;
+    if (received >= bufCap) break;
+
+    int avail = stream->available();
+    if (avail > 0) {
+      int toRead = min(avail, bufCap - received);
+      received += stream->readBytes(buf + received, toRead);
+    } else if (!http.connected()) {
+      break;
+    } else {
+      delay(5);
+    }
+  }
+  http.end();
+
+  if (received == 0 || (knownLength && received != len)) {
+    Serial.printf("Incomplete download (%d bytes received)\n", received);
+    free(buf);
+    return false;
+  }
+  Serial.printf("Bytes received: %d\n", received);
+
+  *outBuf = buf;
+  *outLen = received;
+  return true;
+}
+
+// Decodes an already-downloaded PNG buffer via PNGdec using `drawCb`, then frees it.
+bool decodePng(uint8_t *buf, int len, PNG_DRAW_CALLBACK *drawCb) {
+  bool ok = false;
+  int rc = png.openRAM(buf, len, drawCb);
+  if (rc == PNG_SUCCESS) {
+    tft.setSwapBytes(true);
+    rc = png.decode(NULL, 0);
+    png.close();
+    Serial.printf("PNG decode result: %d\n", rc);
+    ok = true;
+  } else {
+    Serial.printf("PNG open failed: %d\n", rc);
+  }
+  free(buf);
+  return ok;
+}
+
+void showRadar() {
+  // Build an exact lat/lon bounding box around Hilton Head, matched to the screen's
+  // aspect ratio, so NOAA renders precisely the area we want at our exact resolution
+  // — no client-side cropping or digital zoom needed.
+  float latRad     = LOCATION_LAT * PI / 180.0f;
+  float latHalfDeg = RADAR_RADIUS_MI / 69.0f;
+  float lonHalfDeg = (RADAR_RADIUS_MI * ((float)SCREEN_W / SCREEN_H)) / (69.0f * cos(latRad));
+
+  float lonMin = LOCATION_LON - lonHalfDeg;
+  float lonMax = LOCATION_LON + lonHalfDeg;
+  float latMin = LOCATION_LAT - latHalfDeg;
+  float latMax = LOCATION_LAT + latHalfDeg;
+
+  // Static basemap — baked into firmware, draws instantly, no network fetch needed.
+  tft.setSwapBytes(true);
+  tft.pushImage(0, 0, BASEMAP_W, BASEMAP_H, basemap_img);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.setTextSize(2);
+  tft.drawString("Loading radar...", SCREEN_W / 2, SCREEN_H / 2);
+
+  char radarUrl[400];
+  snprintf(radarUrl, sizeof(radarUrl),
+    "%s?service=WMS&version=1.1.1&request=GetMap&layers=%s&styles="
+    "&bbox=%.5f,%.5f,%.5f,%.5f&width=%d&height=%d&srs=EPSG:4326"
+    "&format=image/png&transparent=true",
+    RADAR_WMS_HOST, RADAR_WMS_LAYER, lonMin, latMin, lonMax, latMax, SCREEN_W, SCREEN_H);
+  Serial.printf("Radar WMS URL: %s\n", radarUrl);
+
+  uint8_t *radarBuf = nullptr;
+  int radarLen = 0;
+  bool downloaded = fetchPngToBuffer(radarUrl, &radarBuf, &radarLen);
+
+  // Redraw the basemap now, before decoding — this clears the "Loading radar..."
+  // text cleanly regardless of whether the radar layer ends up drawing anything
+  // over that exact spot (e.g. on a clear day with no echoes nearby).
+  tft.pushImage(0, 0, BASEMAP_W, BASEMAP_H, basemap_img);
+
+  if (downloaded) {
+    decodePng(radarBuf, radarLen, radarPngDraw);
+  } else {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(COL_WHITE, COL_BG);
+    tft.setTextSize(2);
+    tft.drawString("Radar unavailable", SCREEN_W / 2, SCREEN_H / 2);
+  }
+
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_WHITE, COL_BG);
+  tft.setTextSize(1);
+  tft.drawString("RAIN RADAR - HHI", 4, 4);
+
+  char rangeBuf[24];
+  snprintf(rangeBuf, sizeof(rangeBuf), "+/- %d mi", (int)RADAR_RADIUS_MI);
+  tft.drawString(rangeBuf, 4, SCREEN_H - 12);
 }
 
 // ── Full redraw ───────────────────────────────────────────────────────────────
@@ -410,7 +698,8 @@ void setup() {
   tft.init();
   tft.setRotation(3);
   tft.setSwapBytes(true);
-  touch.begin();
+  touchSPI.begin(TOUCH_CLK_PIN, TOUCH_MISO_PIN, TOUCH_MOSI_PIN, TOUCH_CS_PIN);
+  touch.begin(touchSPI);
   touch.setRotation(3);
   lastTouchMs = millis();
 
@@ -457,6 +746,7 @@ void setup() {
   tft.fillScreen(COL_BG);
   tft.drawString("Fetching data...", SCREEN_W/2, SCREEN_H/2);
 
+  resolveGridpoint();
   fetchTides();
   fetchWeather();
   drawAll();
@@ -472,28 +762,74 @@ void loop() {
     return;
   }
 
-  if (touch.tirqTouched() && touch.touched()) {
-    lastTouchMs = now;
-    if (!screenOn) {
-      digitalWrite(BACKLIGHT_PIN, HIGH);
-      screenOn = true;
-      drawAll();
-      Serial.println("Screen ON (touch wake)");
+  // --- Touch edge detection (polled every ~50ms for responsive double-tap) ---
+  TS_Point p = touch.getPoint();
+  bool touchedNow = (p.z > TOUCH_Z_THRESHOLD);
+  if (touchedNow && !touchWasDown) {
+    unsigned long gap = now - lastTapMs;
+
+    if (gap < MIN_TAP_GAP_MS) {
+      // Mechanical bounce of the same physical tap, not a new one — ignore.
+      Serial.printf("Bounce ignored (gap=%lums)\n", gap);
+    } else {
+      Serial.printf("Tap: x=%d y=%d z=%d gap=%lums\n", p.x, p.y, p.z, gap);
+      lastTouchMs = now;  // any real tap resets the sleep timer
+
+      if (!screenOn) {
+        digitalWrite(BACKLIGHT_PIN, HIGH);
+        screenOn = true;
+        if (!radarMode) drawAll();
+        Serial.println("Screen ON (touch wake)");
+      }
+
+      if (gap <= DOUBLE_TAP_WINDOW_MS) {
+        if (!radarMode) {
+          Serial.println("Double-tap detected — showing radar");
+          radarMode    = true;
+          radarStartMs = now;
+          showRadar();
+        }
+        lastTapMs = 0;  // consume the pair so a 3rd tap doesn't chain into another trigger
+      } else {
+        lastTapMs = now;
+      }
     }
   }
+  touchWasDown = touchedNow;
 
-  if (screenOn && (now - lastTouchMs >= SLEEP_MS)) {
+  // --- Radar mode timeout ---
+  if (radarMode && (now - radarStartMs >= RADAR_DURATION_MS)) {
+    radarMode = false;
+    lastTouchMs = now;
+    Serial.println("Radar timeout — returning to normal display");
+    drawAll();
+  }
+
+  // --- Sleep timeout (paused while viewing radar) ---
+  if (screenOn && !radarMode && (now - lastTouchMs >= SLEEP_MS)) {
     digitalWrite(BACKLIGHT_PIN, LOW);
     screenOn = false;
     Serial.println("Screen OFF (sleep)");
   }
 
-  if (!screenOn) { delay(500); return; }
+  if (!screenOn) { delay(50); return; }
 
-  bool redraw = false;
-  if (now - lastTideFetch    >= TIDE_REFRESH_MS)    { fetchTides();   redraw = true; }
-  if (now - lastWeatherFetch >= WEATHER_REFRESH_MS) { fetchWeather(); redraw = true; }
-  if (redraw) drawAll();
+  if (!radarMode) {
+    if (now - lastSleepCountdownMs >= 60000UL) {
+      unsigned long elapsed     = now - lastTouchMs;
+      unsigned long remainingMs = (elapsed >= SLEEP_MS) ? 0 : (SLEEP_MS - elapsed);
+      unsigned long remainMin   = remainingMs / 60000UL;
+      unsigned long remainSec   = (remainingMs / 1000UL) % 60UL;
+      Serial.printf("Sleep in: %lum %02lus\n", remainMin, remainSec);
+      lastSleepCountdownMs = now;
+    }
 
-  delay(30000);
+    bool redraw = false;
+    unsigned long tideInterval = tidesValid ? TIDE_REFRESH_MS : TIDE_RETRY_MS;
+    if (now - lastTideFetch    >= tideInterval)       { fetchTides();   redraw = true; }
+    if (now - lastWeatherFetch >= WEATHER_REFRESH_MS) { fetchWeather(); redraw = true; }
+    if (redraw) drawAll();
+  }
+
+  delay(50);
 }
