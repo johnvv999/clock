@@ -1,0 +1,4 @@
+﻿Option,Primary strength,Load handling,Complexity,Adjustability
+Rack‑and‑pinion depth adjuster,"Direct linear force, no side play",High,Medium,High
+Pivoting boom with servo link,"Simple, fewer parts",Medium,Low,Medium
+Hybrid (rocker + linear slider),Combines leverage + guided motion,Very high,High,Very high

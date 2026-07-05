@@ -95,7 +95,7 @@ const char* RADAR_WMS_LAYER = "conus_bref_qcd";
 
 // Vertical half-extent of the view, in miles. Total view height = 2x this value;
 // width is derived to match the screen's aspect ratio. Lower = more zoomed in.
-const float RADAR_RADIUS_MI = 12.0f;
+const float RADAR_RADIUS_MI = 25.0f;
 
 PNG png;
 
@@ -519,14 +519,16 @@ void drawWeather() {
 // Drawn ON TOP of the basemap — skip any pixel that came out as pure background
 // color (i.e. "no radar echo here") so the basemap underneath stays visible.
 int radarPngDraw(PNGDRAW *pDraw) {
+  if (pDraw->y >= SCREEN_H) return 1;          // height guard
+  int lineW = min((int)pDraw->iWidth, SCREEN_W); // width guard — never overflow lineBuf
   uint16_t lineBuf[SCREEN_W];
-  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_BIG_ENDIAN, 0x00000000);
+  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
 
   int x = 0;
-  while (x < SCREEN_W) {
+  while (x < lineW) {
     if (lineBuf[x] == COL_BG) { x++; continue; }
     int runStart = x;
-    while (x < SCREEN_W && lineBuf[x] != COL_BG) x++;
+    while (x < lineW && lineBuf[x] != COL_BG) x++;
     tft.pushImage(runStart, pDraw->y, x - runStart, 1, &lineBuf[runStart]);
   }
   return 1;
@@ -558,8 +560,15 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
     return false;
   }
 
-  const int MAX_BYTES = 65000;  // buffer cap when length is unknown (chunked encoding)
-  int bufCap = knownLength ? len : MAX_BYTES;
+  const int MAX_BYTES = 100000;  // safe ESP32 heap limit after WiFi stack
+  int bufCap = knownLength ? min(len, MAX_BYTES) : MAX_BYTES;
+
+  // Abort if ESP32 doesn't have enough contiguous heap — avoids silent corruption
+  if ((int)ESP.getMaxAllocHeap() < bufCap + 10000) {
+    Serial.printf("Not enough heap: largest block=%u, need=%d\n", ESP.getMaxAllocHeap(), bufCap);
+    http.end();
+    return false;
+  }
 
   Serial.printf("Heap before malloc: free=%u, largest block=%u, requesting=%d\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap(), bufCap);
