@@ -96,7 +96,7 @@ const char* RADAR_WMS_LAYER = "conus_bref_qcd";
 
 // Vertical half-extent of the view, in miles. Total view height = 2x this value;
 // width is derived to match the screen's aspect ratio. Lower = more zoomed in.
-const float RADAR_RADIUS_MI = 12.0f;
+const float RADAR_RADIUS_MI = 15.0f;
 
 PNG png;
 
@@ -365,7 +365,9 @@ void fetchWeather() {
         DynamicJsonDocument doc(16384);
         DeserializationError err = deserializeJson(doc, gpHttp.getStream());
         if (!err) {
-          rainChance = 0; String shortFc = "clear"; String periodName = "";
+          rainChance = 0;
+          String shortFc = "clear";
+          String periodName = "";
           JsonArray periods = doc["properties"]["periods"].as<JsonArray>();
           int checked = 0;
           for (JsonObject period : periods) {
@@ -379,6 +381,7 @@ void fetchWeather() {
             }
           }
           shortFc.toLowerCase();
+
           int newCode;
           if      (shortFc.indexOf("thunder")  >= 0)                                      newCode = 95;
           else if (shortFc.indexOf("rain")     >= 0 || shortFc.indexOf("shower") >= 0 ||
@@ -386,7 +389,9 @@ void fetchWeather() {
           else if (shortFc.indexOf("fog")      >= 0 || shortFc.indexOf("mist")   >= 0)    newCode = 45;
           else if (shortFc.indexOf("cloud")    >= 0 || shortFc.indexOf("overcast") >= 0)  newCode = 2;
           else                                                                              newCode = 0;
+
           if (newCode > weatherCode) { weatherCode = lastWeatherCode = newCode; }
+
           Serial.printf("NWS rain=%d%% period=\"%s\" forecast=\"%s\" code=%d\n",
                         rainChance, periodName.c_str(), shortFc.c_str(), weatherCode);
         } else {
@@ -515,29 +520,35 @@ void drawWeather() {
 // ── Radar overlay: static basemap image, then live radar data drawn on top ──
 // Drawn ON TOP of the basemap — skip any pixel that came out as pure background
 // color (i.e. "no radar echo here") so the basemap underneath stays visible.
-// Radar alpha: 0=invisible, 255=fully opaque. 180=70%, 128=50%, 220=86%.
-#define RADAR_ALPHA 180
+// Radar overlay alpha: 0=invisible, 255=fully opaque. 180 = ~70% opaque looks good.
+#define RADAR_ALPHA 128
 
+// Blend radar pixel over basemap pixel using RADAR_ALPHA
 static inline uint16_t blendRadar(uint16_t radar, uint16_t base) {
-  uint8_t rR=(radar>>11)&0x1F, rG=(radar>>5)&0x3F, rB=radar&0x1F;
-  uint8_t bR=(base >>11)&0x1F, bG=(base >>5)&0x3F, bB=base &0x1F;
-  uint8_t a=RADAR_ALPHA, ia=255-a;
-  return ((uint16_t)((rR*a+bR*ia)>>8)<<11)|((uint16_t)((rG*a+bG*ia)>>8)<<5)|((uint16_t)((rB*a+bB*ia)>>8));
+  uint8_t rR = (radar >> 11) & 0x1F,  rG = (radar >> 5) & 0x3F,  rB = radar & 0x1F;
+  uint8_t bR = (base  >> 11) & 0x1F,  bG = (base  >> 5) & 0x3F,  bB = base  & 0x1F;
+  uint8_t a  = RADAR_ALPHA, ia = 255 - a;
+  uint8_t oR = (rR * a + bR * ia) >> 8;
+  uint8_t oG = (rG * a + bG * ia) >> 8;
+  uint8_t oB = (rB * a + bB * ia) >> 8;
+  return (oR << 11) | (oG << 5) | oB;
 }
 
 int radarPngDraw(PNGDRAW *pDraw) {
-  if (pDraw->y >= SCREEN_H) return 1;           // height guard
-  int lineW = min((int)pDraw->iWidth, SCREEN_W); // width guard
+  if (pDraw->y >= SCREEN_H) return 1;
+  int lineW = min((int)pDraw->iWidth, SCREEN_W);
   uint16_t lineBuf[SCREEN_W];
   png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
 
+  // Blend each non-transparent radar pixel with the basemap pixel underneath
   uint16_t blended[SCREEN_W];
   int x = 0;
   while (x < lineW) {
     if (lineBuf[x] == COL_BG) { x++; continue; }
     int runStart = x;
     while (x < lineW && lineBuf[x] != COL_BG) {
-      blended[x] = blendRadar(lineBuf[x], pgm_read_word(&basemap_img[pDraw->y * SCREEN_W + x]));
+      uint16_t base = pgm_read_word(&basemap_img[pDraw->y * SCREEN_W + x]);
+      blended[x]   = blendRadar(lineBuf[x], base);
       x++;
     }
     tft.pushImage(runStart, pDraw->y, x - runStart, 1, &blended[runStart]);
@@ -575,11 +586,8 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
   if (MAX_BYTES > 200000) MAX_BYTES = 200000;
   int bufCap = knownLength ? min(len, MAX_BYTES) : MAX_BYTES;
 
-  if ((int)ESP.getMaxAllocHeap() < bufCap + 10000) {
-    Serial.printf("Not enough heap: largest=%u need=%d\n", ESP.getMaxAllocHeap(), bufCap);
-    http.end(); return false;
-  }
-  Serial.printf("Heap: free=%u largest=%u bufCap=%d\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap(), bufCap);
+  Serial.printf("Heap before malloc: free=%u, largest=%u, bufCap=%d\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap(), bufCap);
 
   uint8_t *buf = (uint8_t*)malloc(bufCap);
   if (!buf) {
