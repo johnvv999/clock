@@ -96,7 +96,7 @@ const char* RADAR_WMS_LAYER = "conus_bref_qcd";
 
 // Vertical half-extent of the view, in miles. Total view height = 2x this value;
 // width is derived to match the screen's aspect ratio. Lower = more zoomed in.
-const float RADAR_RADIUS_MI = 12.0f;
+const float RADAR_RADIUS_MI = 15.0f;
 
 PNG png;
 
@@ -520,18 +520,38 @@ void drawWeather() {
 // ── Radar overlay: static basemap image, then live radar data drawn on top ──
 // Drawn ON TOP of the basemap — skip any pixel that came out as pure background
 // color (i.e. "no radar echo here") so the basemap underneath stays visible.
+// Radar overlay alpha: 0=invisible, 255=fully opaque. 180 = ~70% opaque looks good.
+#define RADAR_ALPHA 128
+
+// Blend radar pixel over basemap pixel using RADAR_ALPHA
+static inline uint16_t blendRadar(uint16_t radar, uint16_t base) {
+  uint8_t rR = (radar >> 11) & 0x1F,  rG = (radar >> 5) & 0x3F,  rB = radar & 0x1F;
+  uint8_t bR = (base  >> 11) & 0x1F,  bG = (base  >> 5) & 0x3F,  bB = base  & 0x1F;
+  uint8_t a  = RADAR_ALPHA, ia = 255 - a;
+  uint8_t oR = (rR * a + bR * ia) >> 8;
+  uint8_t oG = (rG * a + bG * ia) >> 8;
+  uint8_t oB = (rB * a + bB * ia) >> 8;
+  return (oR << 11) | (oG << 5) | oB;
+}
+
 int radarPngDraw(PNGDRAW *pDraw) {
   if (pDraw->y >= SCREEN_H) return 1;
   int lineW = min((int)pDraw->iWidth, SCREEN_W);
   uint16_t lineBuf[SCREEN_W];
   png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
 
+  // Blend each non-transparent radar pixel with the basemap pixel underneath
+  uint16_t blended[SCREEN_W];
   int x = 0;
   while (x < lineW) {
     if (lineBuf[x] == COL_BG) { x++; continue; }
     int runStart = x;
-    while (x < lineW && lineBuf[x] != COL_BG) x++;
-    tft.pushImage(runStart, pDraw->y, x - runStart, 1, &lineBuf[runStart]);
+    while (x < lineW && lineBuf[x] != COL_BG) {
+      uint16_t base = pgm_read_word(&basemap_img[pDraw->y * SCREEN_W + x]);
+      blended[x]   = blendRadar(lineBuf[x], base);
+      x++;
+    }
+    tft.pushImage(runStart, pDraw->y, x - runStart, 1, &blended[runStart]);
   }
   return 1;
 }
@@ -562,15 +582,11 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
     return false;
   }
 
-  const int MAX_BYTES = 100000;  // safe ESP32 heap limit after WiFi stack
+  int MAX_BYTES = max(40000, (int)ESP.getMaxAllocHeap() - 20000);
+  if (MAX_BYTES > 200000) MAX_BYTES = 200000;
   int bufCap = knownLength ? min(len, MAX_BYTES) : MAX_BYTES;
 
-  if ((int)ESP.getMaxAllocHeap() < bufCap + 10000) {
-    Serial.printf("Not enough heap: largest=%u need=%d\n", ESP.getMaxAllocHeap(), bufCap);
-    http.end();
-    return false;
-  }
-  Serial.printf("Heap before malloc: free=%u, largest block=%u, requesting=%d\n",
+  Serial.printf("Heap before malloc: free=%u, largest=%u, bufCap=%d\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap(), bufCap);
 
   uint8_t *buf = (uint8_t*)malloc(bufCap);
@@ -654,7 +670,7 @@ void showRadar() {
   snprintf(radarUrl, sizeof(radarUrl),
     "%s?service=WMS&version=1.1.1&request=GetMap&layers=%s&styles="
     "&bbox=%.5f,%.5f,%.5f,%.5f&width=%d&height=%d&srs=EPSG:4326"
-    "&format=image/png&transparent=true",
+    "&format=image/png8&transparent=true",
     RADAR_WMS_HOST, RADAR_WMS_LAYER, lonMin, latMin, lonMax, latMax, SCREEN_W, SCREEN_H);
   Serial.printf("Radar WMS URL: %s\n", radarUrl);
 

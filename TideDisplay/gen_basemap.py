@@ -15,7 +15,7 @@ from PIL import Image
 # ── Must match TideDisplay.ino constants exactly ───────────────────────────────
 LOCATION_LAT    = 32.2163
 LOCATION_LON    = -80.7526
-RADAR_RADIUS_MI = 12.0      # change this if you change it in the .ino
+RADAR_RADIUS_MI = 15.0      # change this if you change it in the .ino
 SCREEN_W        = 320
 SCREEN_H        = 240
 
