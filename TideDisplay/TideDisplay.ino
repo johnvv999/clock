@@ -41,6 +41,7 @@ const float LOCATION_LON     = -80.7526;
 const char* NWS_USER_AGENT   = "(TideDisplay, johnvv999@example.com)";
 
 String rainForecastUrl = "";  // properties.forecastHourly from /points lookup
+String rainForecastDailyUrl = "";  // properties.forecast (daily periods) from /points lookup
 
 // ── Refresh intervals ─────────────────────────────────────────────────────────
 const unsigned long TIDE_REFRESH_MS    = 6UL * 3600UL * 1000UL;
@@ -95,7 +96,7 @@ const char* RADAR_WMS_LAYER = "conus_bref_qcd";
 
 // Vertical half-extent of the view, in miles. Total view height = 2x this value;
 // width is derived to match the screen's aspect ratio. Lower = more zoomed in.
-const float RADAR_RADIUS_MI = 25.0f;
+const float RADAR_RADIUS_MI = 12.0f;
 
 PNG png;
 
@@ -206,8 +207,10 @@ bool resolveGridpoint() {
     Serial.printf("Gridpoint JSON parse error: %s\n", err.c_str());
     return false;
   }
-  rainForecastUrl = doc["properties"]["forecastHourly"].as<String>();
+  rainForecastUrl      = doc["properties"]["forecastHourly"].as<String>();
+  rainForecastDailyUrl = doc["properties"]["forecast"].as<String>();
   Serial.printf("Resolved forecastHourly URL: %s\n", rainForecastUrl.c_str());
+  Serial.printf("Resolved forecast URL: %s\n", rainForecastDailyUrl.c_str());
   return rainForecastUrl.length() > 0;
 }
 
@@ -333,36 +336,51 @@ void fetchWeather() {
     nwsHttp.end();
   }
 
-  // --- NWS gridpoint hourly forecast: rain chance + conditions ---
+  // --- NWS forecast: rain chance + conditions (daily periods — matches NWS website) ---
   {
-    if (rainForecastUrl.length() == 0) {
+    if (rainForecastDailyUrl.length() == 0) {
       resolveGridpoint();
     }
 
-    if (rainForecastUrl.length() > 0) {
+    if (rainForecastDailyUrl.length() > 0) {
       WiFiClientSecure gpClient;
       gpClient.setInsecure();
       HTTPClient gpHttp;
-      gpHttp.begin(gpClient, rainForecastUrl);
+      gpHttp.begin(gpClient, rainForecastDailyUrl);
       gpHttp.setTimeout(20000);
       gpHttp.addHeader("User-Agent", NWS_USER_AGENT);
       gpHttp.addHeader("Accept", "application/geo+json");
       int code = gpHttp.GET();
 
       if (code == 200) {
-        // Only keep the fields we need from periods[0] — keeps the doc small
-        StaticJsonDocument<128> filter;
-        filter["properties"]["periods"][0]["probabilityOfPrecipitation"] = true;
-        filter["properties"]["periods"][0]["shortForecast"] = true;
+        // Scan first 4 periods (This Afternoon / Tonight / Tomorrow AM / Tomorrow PM)
+        // and pick the one with highest rain probability — mirrors NWS.gov display
+        StaticJsonDocument<200> filter;
+        for (int i = 0; i < 4; i++) {
+          filter["properties"]["periods"][i]["probabilityOfPrecipitation"] = true;
+          filter["properties"]["periods"][i]["shortForecast"] = true;
+          filter["properties"]["periods"][i]["name"] = true;
+        }
 
-        DynamicJsonDocument doc(16384);
+        DynamicJsonDocument doc(8192);
         DeserializationError err = deserializeJson(doc, gpHttp.getStream(),
-                                                     DeserializationOption::Filter(filter));
+                                                   DeserializationOption::Filter(filter));
         if (!err) {
-          JsonVariant pop = doc["properties"]["periods"][0]["probabilityOfPrecipitation"]["value"];
-          rainChance = pop.is<int>() ? pop.as<int>() : 0;
+          rainChance = 0;
+          String shortFc = "";
+          String periodName = "";
 
-          String shortFc = doc["properties"]["periods"][0]["shortForecast"].as<String>();
+          for (int i = 0; i < 4; i++) {
+            JsonVariant period = doc["properties"]["periods"][i];
+            if (period.isNull()) break;
+            JsonVariant pop = period["probabilityOfPrecipitation"]["value"];
+            int pct = pop.is<int>() ? pop.as<int>() : 0;
+            if (pct > rainChance) {
+              rainChance = pct;
+              shortFc    = period["shortForecast"].as<String>();
+              periodName = period["name"].as<String>();
+            }
+          }
           shortFc.toLowerCase();
 
           int newCode;
@@ -377,7 +395,7 @@ void fetchWeather() {
           } else if (shortFc.indexOf("cloud") >= 0 || shortFc.indexOf("overcast") >= 0) {
             newCode = 2;
           } else {
-            newCode = 0;  // clear / sunny / mostly sunny
+            newCode = 0;
           }
 
           if (newCode <= 3 || rainChance > 50) {
@@ -387,16 +405,15 @@ void fetchWeather() {
             weatherCode = lastWeatherCode;
           }
 
-          Serial.printf("NWS rain=%d%%  forecast=\"%s\"  code=%d\n",
-                        rainChance, shortFc.c_str(), weatherCode);
+          Serial.printf("NWS rain=%d%% period=\"%s\"  forecast=\"%s\"  code=%d\n",
+                        rainChance, periodName.c_str(), shortFc.c_str(), weatherCode);
         } else {
-          Serial.printf("NWS gridpoint JSON parse failed: %s\n", err.c_str());
+          Serial.printf("NWS forecast JSON parse failed: %s\n", err.c_str());
         }
       } else {
-        Serial.printf("NWS gridpoint HTTP error: %d\n", code);
+        Serial.printf("NWS forecast HTTP error: %d\n", code);
         if (code == 301 || code == 404) {
-          // grid mapping may have shifted — force a re-lookup next cycle
-          rainForecastUrl = "";
+          rainForecastDailyUrl = "";
         }
       }
       gpHttp.end();
@@ -519,16 +536,14 @@ void drawWeather() {
 // Drawn ON TOP of the basemap — skip any pixel that came out as pure background
 // color (i.e. "no radar echo here") so the basemap underneath stays visible.
 int radarPngDraw(PNGDRAW *pDraw) {
-  if (pDraw->y >= SCREEN_H) return 1;          // height guard
-  int lineW = min((int)pDraw->iWidth, SCREEN_W); // width guard — never overflow lineBuf
   uint16_t lineBuf[SCREEN_W];
-  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
+  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_BIG_ENDIAN, 0x00000000);
 
   int x = 0;
-  while (x < lineW) {
+  while (x < SCREEN_W) {
     if (lineBuf[x] == COL_BG) { x++; continue; }
     int runStart = x;
-    while (x < lineW && lineBuf[x] != COL_BG) x++;
+    while (x < SCREEN_W && lineBuf[x] != COL_BG) x++;
     tft.pushImage(runStart, pDraw->y, x - runStart, 1, &lineBuf[runStart]);
   }
   return 1;
@@ -560,15 +575,8 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
     return false;
   }
 
-  const int MAX_BYTES = 100000;  // safe ESP32 heap limit after WiFi stack
-  int bufCap = knownLength ? min(len, MAX_BYTES) : MAX_BYTES;
-
-  // Abort if ESP32 doesn't have enough contiguous heap — avoids silent corruption
-  if ((int)ESP.getMaxAllocHeap() < bufCap + 10000) {
-    Serial.printf("Not enough heap: largest block=%u, need=%d\n", ESP.getMaxAllocHeap(), bufCap);
-    http.end();
-    return false;
-  }
+  const int MAX_BYTES = 65000;  // buffer cap when length is unknown (chunked encoding)
+  int bufCap = knownLength ? len : MAX_BYTES;
 
   Serial.printf("Heap before malloc: free=%u, largest block=%u, requesting=%d\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap(), bufCap);
