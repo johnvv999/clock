@@ -41,7 +41,6 @@ const float LOCATION_LON     = -80.7526;
 const char* NWS_USER_AGENT   = "(TideDisplay, johnvv999@example.com)";
 
 String rainForecastUrl = "";  // properties.forecastHourly from /points lookup
-String rainForecastDailyUrl = "";  // properties.forecast (daily periods) from /points lookup
 
 // ── Refresh intervals ─────────────────────────────────────────────────────────
 const unsigned long TIDE_REFRESH_MS    = 6UL * 3600UL * 1000UL;
@@ -207,10 +206,8 @@ bool resolveGridpoint() {
     Serial.printf("Gridpoint JSON parse error: %s\n", err.c_str());
     return false;
   }
-  rainForecastUrl      = doc["properties"]["forecastHourly"].as<String>();
-  rainForecastDailyUrl = doc["properties"]["forecast"].as<String>();
+  rainForecastUrl = doc["properties"]["forecastHourly"].as<String>();
   Serial.printf("Resolved forecastHourly URL: %s\n", rainForecastUrl.c_str());
-  Serial.printf("Resolved forecast URL: %s\n", rainForecastDailyUrl.c_str());
   return rainForecastUrl.length() > 0;
 }
 
@@ -306,7 +303,7 @@ void fetchWeather() {
     int code = nwsHttp.GET();
     if (code == 200) {
       String body = nwsHttp.getString();
-      DynamicJsonDocument doc(4096);
+      DynamicJsonDocument doc(6144);
       if (!deserializeJson(doc, body)) {
         JsonVariant tempVal = doc["properties"]["temperature"]["value"];
         JsonVariant rhVal   = doc["properties"]["relativeHumidity"]["value"];
@@ -322,6 +319,22 @@ void fetchWeather() {
 
           feelsLikeTemp = calcFeelsLike(currentTemp, rh, windMph);
 
+          // Use current observed conditions for icon — overrides forecast icon
+          // when station is actually reporting thunder/rain right now
+          String obsDesc = doc["properties"]["textDescription"].as<String>();
+          obsDesc.toLowerCase();
+          Serial.printf("NWS observed: \"%.s\"\n", obsDesc.c_str());
+          if (obsDesc.indexOf("thunder") >= 0) {
+            weatherCode = lastWeatherCode = 95;
+          } else if (obsDesc.indexOf("rain") >= 0 || obsDesc.indexOf("shower") >= 0 ||
+                     obsDesc.indexOf("drizzle") >= 0) {
+            weatherCode = lastWeatherCode = 61;
+          } else if (obsDesc.indexOf("fog") >= 0 || obsDesc.indexOf("mist") >= 0) {
+            weatherCode = lastWeatherCode = 45;
+          } else if (obsDesc.indexOf("cloud") >= 0 || obsDesc.indexOf("overcast") >= 0) {
+            weatherCode = lastWeatherCode = 2;
+          }
+
           Serial.printf("NWS temp: %.1fF  RH: %.0f%%  Wind: %.1fmph  Feels: %.1fF\n",
                         currentTemp, rh, windMph, feelsLikeTemp);
         } else {
@@ -336,51 +349,36 @@ void fetchWeather() {
     nwsHttp.end();
   }
 
-  // --- NWS forecast: rain chance + conditions (daily periods — matches NWS website) ---
+  // --- NWS gridpoint hourly forecast: rain chance + conditions ---
   {
-    if (rainForecastDailyUrl.length() == 0) {
+    if (rainForecastUrl.length() == 0) {
       resolveGridpoint();
     }
 
-    if (rainForecastDailyUrl.length() > 0) {
+    if (rainForecastUrl.length() > 0) {
       WiFiClientSecure gpClient;
       gpClient.setInsecure();
       HTTPClient gpHttp;
-      gpHttp.begin(gpClient, rainForecastDailyUrl);
+      gpHttp.begin(gpClient, rainForecastUrl);
       gpHttp.setTimeout(20000);
       gpHttp.addHeader("User-Agent", NWS_USER_AGENT);
       gpHttp.addHeader("Accept", "application/geo+json");
       int code = gpHttp.GET();
 
       if (code == 200) {
-        // Scan first 4 periods (This Afternoon / Tonight / Tomorrow AM / Tomorrow PM)
-        // and pick the one with highest rain probability — mirrors NWS.gov display
-        StaticJsonDocument<200> filter;
-        for (int i = 0; i < 4; i++) {
-          filter["properties"]["periods"][i]["probabilityOfPrecipitation"] = true;
-          filter["properties"]["periods"][i]["shortForecast"] = true;
-          filter["properties"]["periods"][i]["name"] = true;
-        }
+        // Only keep the fields we need from periods[0] — keeps the doc small
+        StaticJsonDocument<128> filter;
+        filter["properties"]["periods"][0]["probabilityOfPrecipitation"] = true;
+        filter["properties"]["periods"][0]["shortForecast"] = true;
 
-        DynamicJsonDocument doc(8192);
+        DynamicJsonDocument doc(16384);
         DeserializationError err = deserializeJson(doc, gpHttp.getStream(),
-                                                   DeserializationOption::Filter(filter));
+                                                     DeserializationOption::Filter(filter));
         if (!err) {
-          rainChance = 0;
-          String shortFc = "";
-          String periodName = "";
+          JsonVariant pop = doc["properties"]["periods"][0]["probabilityOfPrecipitation"]["value"];
+          rainChance = pop.is<int>() ? pop.as<int>() : 0;
 
-          for (int i = 0; i < 4; i++) {
-            JsonVariant period = doc["properties"]["periods"][i];
-            if (period.isNull()) break;
-            JsonVariant pop = period["probabilityOfPrecipitation"]["value"];
-            int pct = pop.is<int>() ? pop.as<int>() : 0;
-            if (pct > rainChance) {
-              rainChance = pct;
-              shortFc    = period["shortForecast"].as<String>();
-              periodName = period["name"].as<String>();
-            }
-          }
+          String shortFc = doc["properties"]["periods"][0]["shortForecast"].as<String>();
           shortFc.toLowerCase();
 
           int newCode;
@@ -395,25 +393,26 @@ void fetchWeather() {
           } else if (shortFc.indexOf("cloud") >= 0 || shortFc.indexOf("overcast") >= 0) {
             newCode = 2;
           } else {
-            newCode = 0;
+            newCode = 0;  // clear / sunny / mostly sunny
           }
 
-          if (newCode <= 3 || rainChance > 50) {
+          if (newCode <= 3 || rainChance >= 30) {  // 30% threshold — matches NWS advisory level
             weatherCode     = newCode;
             lastWeatherCode = newCode;
           } else {
             weatherCode = lastWeatherCode;
           }
 
-          Serial.printf("NWS rain=%d%% period=\"%s\"  forecast=\"%s\"  code=%d\n",
-                        rainChance, periodName.c_str(), shortFc.c_str(), weatherCode);
+          Serial.printf("NWS rain=%d%%  forecast=\"%s\"  code=%d\n",
+                        rainChance, shortFc.c_str(), weatherCode);
         } else {
-          Serial.printf("NWS forecast JSON parse failed: %s\n", err.c_str());
+          Serial.printf("NWS gridpoint JSON parse failed: %s\n", err.c_str());
         }
       } else {
-        Serial.printf("NWS forecast HTTP error: %d\n", code);
+        Serial.printf("NWS gridpoint HTTP error: %d\n", code);
         if (code == 301 || code == 404) {
-          rainForecastDailyUrl = "";
+          // grid mapping may have shifted — force a re-lookup next cycle
+          rainForecastUrl = "";
         }
       }
       gpHttp.end();
