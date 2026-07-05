@@ -39,7 +39,7 @@ def lat_to_y(lat, z): return int((1 - math.log(math.tan(math.radians(lat)) + 1/m
 def x_to_lon(x, z):  return x / 2**z * 360 - 180
 def y_to_lat(y, z):  return math.degrees(math.atan(math.sinh(math.pi * (1 - 2*y/2**z))))
 
-ZOOM = 11
+ZOOM = 12
 tx0 = lon_to_x(LON_MIN, ZOOM);  tx1 = lon_to_x(LON_MAX, ZOOM)
 ty0 = lat_to_y(LAT_MAX, ZOOM);  ty1 = lat_to_y(LAT_MIN, ZOOM)
 cols = tx1 - tx0 + 1;  rows = ty1 - ty0 + 1
