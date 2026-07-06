@@ -515,7 +515,7 @@ void drawWeather() {
 // ── Radar overlay: static basemap image, then live radar data drawn on top ──
 // Drawn ON TOP of the basemap — skip any pixel that came out as pure background
 // color (i.e. "no radar echo here") so the basemap underneath stays visible.
-// Radar alpha: 0=invisible, 255=fully opaque. 180=70%, 128=50%, 220=86%.
+// Radar transparency: 0=invisible 255=fully opaque. 180=70%, 128=50%, 220=86%.
 #define RADAR_ALPHA 180
 
 static inline uint16_t blendRadar(uint16_t radar, uint16_t base) {
@@ -529,6 +529,8 @@ int radarPngDraw(PNGDRAW *pDraw) {
   if (pDraw->y >= SCREEN_H) return 1;           // height guard
   int lineW = min((int)pDraw->iWidth, SCREEN_W); // width guard
   uint16_t lineBuf[SCREEN_W];
+  // LITTLE_ENDIAN matches tft.setSwapBytes(true) set in decodePng
+  // Background 0x00000000 maps transparent pixels to 0x0000 (black = COL_BG)
   png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
 
   uint16_t blended[SCREEN_W];
@@ -662,7 +664,7 @@ void showRadar() {
   snprintf(radarUrl, sizeof(radarUrl),
     "%s?service=WMS&version=1.1.1&request=GetMap&layers=%s&styles="
     "&bbox=%.5f,%.5f,%.5f,%.5f&width=%d&height=%d&srs=EPSG:4326"
-    "&format=image/png8&transparent=true",
+    "&format=image/png&transparent=true",
     RADAR_WMS_HOST, RADAR_WMS_LAYER, lonMin, latMin, lonMax, latMax, SCREEN_W, SCREEN_H);
   Serial.printf("Radar WMS URL: %s\n", radarUrl);
 
