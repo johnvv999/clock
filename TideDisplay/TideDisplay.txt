@@ -5,8 +5,6 @@
  * Location: Hilton Head Island, SC 29928  (NOAA Station 8665530)
  * Temperature + Feels-like: NWS KHXD (Hilton Head Airport) — real observed data
  * Rain chance + weather code: NWS gridpoint hourly forecast
- *
- * Screens: home -> (double-tap) -> radar -> (tap) -> today's forecast -> (tap) -> home
  */
 
 #include <WiFi.h>
@@ -42,8 +40,8 @@ const float LOCATION_LAT     = 32.2163;
 const float LOCATION_LON     = -80.7526;
 const char* NWS_USER_AGENT   = "(TideDisplay, johnvv999@example.com)";
 
-String rainForecastUrl      = "";  // properties.forecastHourly from /points lookup
-String rainForecastDailyUrl = "";  // properties.forecast (daily) from /points lookup — today's high/low
+String rainForecastUrl = "";       // properties.forecastHourly from /points lookup
+String rainForecastDailyUrl = "";  // properties.forecast (daily) from /points lookup
 
 // ── Refresh intervals ─────────────────────────────────────────────────────────
 const unsigned long TIDE_REFRESH_MS    = 6UL * 3600UL * 1000UL;
@@ -79,17 +77,6 @@ const int TOUCH_Z_THRESHOLD              = 150;  // lower = lighter touches regi
 bool radarMode = false;
 unsigned long radarStartMs = 0;
 const unsigned long RADAR_DURATION_MS = 60UL * 1000UL;
-
-// ── Forecast screen mode ──────────────────────────────────────────────────────
-// Tap sequence: home (double-tap) → radar (tap) → forecast (tap) → home.
-bool forecastMode = false;
-unsigned long forecastStartMs = 0;
-const unsigned long FORECAST_DURATION_MS = 60UL * 1000UL;
-
-// Only count a period as "rain starting" if the forecast is reasonably confident
-// (chance of precipitation above this threshold) — filters out low-confidence
-// "slight chance" mentions from triggering the callout on the forecast screen.
-const int RAIN_START_THRESHOLD_PCT = 50;
 
 // NOAA's GeoServer WMS — lets us request an exact lat/lon bounding box rendered
 // at our exact pixel size, at full native "Super Resolution" radar data, instead
@@ -140,26 +127,9 @@ bool  tidesValid       = false;
 float currentTemp     = 0.0f;
 float feelsLikeTemp   = 0.0f;
 int   weatherCode     = 0;
+int   lastWeatherCode = 0;
 int   rainChance      = 0;
 bool  weatherValid    = false;
-
-// ── Today's forecast screen data ─────────────────────────────────────────────
-struct ForecastHour {
-  char time[10];   // e.g. "2 PM" / "2:30 PM"
-  int  pop;        // rain chance, %
-  bool isRain;      // shortForecast for this hour mentions rain/showers/thunder
-};
-const int MAX_FORECAST_HOURS = 8;
-ForecastHour todayForecast[MAX_FORECAST_HOURS];
-int  todayForecastCount = 0;
-bool rainExpectedToday  = false;
-char rainStartTime[10]  = "";
-int  todayMaxRainChance = 0;
-bool forecastDataValid  = false;
-int  todayHighTemp      = 0;
-int  todayLowTemp       = 0;
-bool todayHighValid     = false;
-bool todayLowValid      = false;
 
 unsigned long lastTideFetch    = 0;
 unsigned long lastWeatherFetch = 0;
@@ -209,22 +179,6 @@ void parseNoaaTime(const char* iso, char* timeOut, char* dateOut) {
   snprintf(timeOut, 12, "%d:%02d %s", hr12, mn, ampm);
 }
 
-// ── Parse NWS ISO8601 time (e.g. "2026-07-10T14:00:00-04:00") ───────────────
-// dateOut gets "YYYYMMDD" (for same-day comparisons), timeOut gets a compact
-// 12-hour clock string ("2 PM" / "2:30 PM"). Either pointer may be NULL.
-void parseNwsIsoTime(const char* iso, char* dateOut, char* timeOut) {
-  int yr, mo, dy, hr, mn;
-  sscanf(iso, "%d-%d-%dT%d:%d", &yr, &mo, &dy, &hr, &mn);
-  if (dateOut) snprintf(dateOut, 9, "%04d%02d%02d", yr, mo, dy);
-  if (timeOut) {
-    const char* ampm = (hr >= 12) ? "PM" : "AM";
-    int hr12 = hr % 12;
-    if (hr12 == 0) hr12 = 12;
-    if (mn == 0) snprintf(timeOut, 10, "%d %s", hr12, ampm);
-    else         snprintf(timeOut, 10, "%d:%02d %s", hr12, mn, ampm);
-  }
-}
-
 
 
 
@@ -256,7 +210,7 @@ bool resolveGridpoint() {
   rainForecastUrl      = doc["properties"]["forecastHourly"].as<String>();
   rainForecastDailyUrl = doc["properties"]["forecast"].as<String>();
   Serial.printf("Resolved forecastHourly URL: %s\n", rainForecastUrl.c_str());
-  Serial.printf("Resolved forecast (daily) URL: %s\n", rainForecastDailyUrl.c_str());
+  Serial.printf("Resolved forecast URL: %s\n", rainForecastDailyUrl.c_str());
   return rainForecastUrl.length() > 0;
 }
 
@@ -339,11 +293,6 @@ void fetchTides() {
 
 // ── Fetch weather ─────────────────────────────────────────────────────────────
 void fetchWeather() {
-  time_t nowT = time(nullptr);
-  struct tm ti;
-  localtime_r(&nowT, &ti);
-  char todayDate[9];
-  strftime(todayDate, sizeof(todayDate), "%Y%m%d", &ti);
 
   // --- NWS: temperature, humidity, wind — all from real KHXD station ---
   {
@@ -376,11 +325,11 @@ void fetchWeather() {
           String obsDesc = doc["properties"]["textDescription"].as<String>();
           obsDesc.toLowerCase();
           Serial.printf("NWS observed: \"%s\"\n", obsDesc.c_str());
-          if      (obsDesc.indexOf("thunder")  >= 0)                                      { weatherCode = 95; }
-          else if (obsDesc.indexOf("rain")     >= 0 || obsDesc.indexOf("shower") >= 0)   { weatherCode = 61; }
-          else if (obsDesc.indexOf("fog")      >= 0 || obsDesc.indexOf("mist")   >= 0)   { weatherCode = 45; }
-          else if (obsDesc.indexOf("cloud")    >= 0 || obsDesc.indexOf("overcast") >= 0) { weatherCode = 2;  }
-          else                                                                             { weatherCode = 0;  }
+          if      (obsDesc.indexOf("thunder")  >= 0)                                      { weatherCode = lastWeatherCode = 95; }
+          else if (obsDesc.indexOf("rain")     >= 0 || obsDesc.indexOf("shower") >= 0)   { weatherCode = lastWeatherCode = 61; }
+          else if (obsDesc.indexOf("fog")      >= 0 || obsDesc.indexOf("mist")   >= 0)   { weatherCode = lastWeatherCode = 45; }
+          else if (obsDesc.indexOf("cloud")    >= 0 || obsDesc.indexOf("overcast") >= 0) { weatherCode = lastWeatherCode = 2;  }
+          else                                                                             { weatherCode = lastWeatherCode = 0;  }
 
           Serial.printf("NWS temp: %.1fF  RH: %.0f%%  Wind: %.1fmph  Feels: %.1fF\n",
                         currentTemp, rh, windMph, feelsLikeTemp);
@@ -396,90 +345,39 @@ void fetchWeather() {
     nwsHttp.end();
   }
 
-  // --- NWS hourly forecast: rain chance + conditions ---
+  // --- NWS daily forecast: rain chance + conditions ---
   {
-    if (rainForecastUrl.length() == 0) {
+    if (rainForecastDailyUrl.length() == 0) {
       resolveGridpoint();
     }
 
-    if (rainForecastUrl.length() > 0) {
+    if (rainForecastDailyUrl.length() > 0) {
       WiFiClientSecure gpClient;
       gpClient.setInsecure();
       HTTPClient gpHttp;
-      gpHttp.begin(gpClient, rainForecastUrl);
+      gpHttp.begin(gpClient, rainForecastDailyUrl);
       gpHttp.setTimeout(20000);
       gpHttp.addHeader("User-Agent", NWS_USER_AGENT);
       gpHttp.addHeader("Accept", "application/geo+json");
       int code = gpHttp.GET();
 
       if (code == 200) {
-        // Hourly forecast has ~150 periods (vs. ~14 for the daily endpoint) — filter
-        // down to just the fields we use so the parsed doc stays small on the ESP32.
-        StaticJsonDocument<192> filter;
-        filter["properties"]["periods"][0]["startTime"] = true;
-        filter["properties"]["periods"][0]["shortForecast"] = true;
-        filter["properties"]["periods"][0]["probabilityOfPrecipitation"]["value"] = true;
-
-        // Bumped up from the original 16KB now that startTime is included and we
-        // walk up to 24 periods instead of 4 — still comfortably freed right after
-        // this block since `doc` is scoped to it.
-        DynamicJsonDocument doc(24576);
-        DeserializationError err = deserializeJson(doc, gpHttp.getStream(),
-                                                     DeserializationOption::Filter(filter));
+        DynamicJsonDocument doc(16384);
+        DeserializationError err = deserializeJson(doc, gpHttp.getStream());
         if (!err) {
-          rainChance = 0; String shortFc = "clear"; String bestPeriodTime = "";
-          todayForecastCount = 0;
-          rainExpectedToday  = false;
-          rainStartTime[0]   = '\0';
-          todayMaxRainChance = 0;
-
+          rainChance = 0; String shortFc = "clear"; String periodName = "";
           JsonArray periods = doc["properties"]["periods"].as<JsonArray>();
-          int idx = 0;
+          int checked = 0;
           for (JsonObject period : periods) {
-            if (idx >= 24) break;  // next 24 hourly periods is plenty to cover "today"
-
-            const char* startIso = period["startTime"] | "";
-            char pDate[9], pTime[10];
-            parseNwsIsoTime(startIso, pDate, pTime);
-
+            if (checked++ >= 4) break;
             JsonVariant pop = period["probabilityOfPrecipitation"]["value"];
             int pct = pop.is<int>() ? pop.as<int>() : 0;
-            String periodFc = period["shortForecast"].as<String>();
-            String periodFcLower = periodFc;
-            periodFcLower.toLowerCase();
-            bool periodIsRain = periodFcLower.indexOf("rain")    >= 0 ||
-                                 periodFcLower.indexOf("shower")  >= 0 ||
-                                 periodFcLower.indexOf("drizzle") >= 0 ||
-                                 periodFcLower.indexOf("thunder") >= 0;
-
-            // Near-term (next 4 hours): drives the compact rain% + icon on the home screen.
-            if (idx < 4 && pct > rainChance) {
-              rainChance     = pct;
-              shortFc        = periodFc;
-              bestPeriodTime = String(pTime);
+            if (pct > rainChance) {
+              rainChance = pct;
+              shortFc    = period["shortForecast"].as<String>();
+              periodName = period["name"].as<String>();
             }
-
-            // Today's forecast screen: every hour still on today's calendar date.
-            if (strcmp(pDate, todayDate) == 0) {
-              if (pct > todayMaxRainChance) todayMaxRainChance = pct;
-              if (pct > RAIN_START_THRESHOLD_PCT && !rainExpectedToday) {
-                rainExpectedToday = true;
-                strncpy(rainStartTime, pTime, sizeof(rainStartTime) - 1);
-                rainStartTime[sizeof(rainStartTime) - 1] = '\0';
-              }
-              if (todayForecastCount < MAX_FORECAST_HOURS) {
-                strncpy(todayForecast[todayForecastCount].time, pTime,
-                        sizeof(todayForecast[todayForecastCount].time) - 1);
-                todayForecast[todayForecastCount].time[sizeof(todayForecast[todayForecastCount].time) - 1] = '\0';
-                todayForecast[todayForecastCount].pop    = pct;
-                todayForecast[todayForecastCount].isRain = periodIsRain;
-                todayForecastCount++;
-              }
-            }
-            idx++;
           }
-          forecastDataValid = true;
-
           shortFc.toLowerCase();
           int newCode;
           if      (shortFc.indexOf("thunder")  >= 0)                                      newCode = 95;
@@ -488,17 +386,15 @@ void fetchWeather() {
           else if (shortFc.indexOf("fog")      >= 0 || shortFc.indexOf("mist")   >= 0)    newCode = 45;
           else if (shortFc.indexOf("cloud")    >= 0 || shortFc.indexOf("overcast") >= 0)  newCode = 2;
           else                                                                              newCode = 0;
-          if (newCode > weatherCode) { weatherCode = newCode; }
+          if (newCode > weatherCode) { weatherCode = lastWeatherCode = newCode; }
           Serial.printf("NWS rain=%d%% period=\"%s\" forecast=\"%s\" code=%d\n",
-                        rainChance, bestPeriodTime.c_str(), shortFc.c_str(), weatherCode);
-          Serial.printf("Today: maxRain=%d%% rainStart=%s hours=%d\n",
-                        todayMaxRainChance, rainExpectedToday ? rainStartTime : "none", todayForecastCount);
+                        rainChance, periodName.c_str(), shortFc.c_str(), weatherCode);
         } else {
-          Serial.printf("NWS hourly forecast JSON parse failed: %s\n", err.c_str());
+          Serial.printf("NWS forecast JSON parse failed: %s\n", err.c_str());
         }
       } else {
-        Serial.printf("NWS hourly forecast HTTP error: %d\n", code);
-        if (code == 301 || code == 404) rainForecastUrl = "";
+        Serial.printf("NWS forecast HTTP error: %d\n", code);
+        if (code == 301 || code == 404) rainForecastDailyUrl = "";
       }
       gpHttp.end();
     }
@@ -507,64 +403,8 @@ void fetchWeather() {
     lastWeatherFetch = millis();
   }
 
-  // --- NWS daily forecast: today's high/low temps ---
-  {
-    if (rainForecastDailyUrl.length() == 0) {
-      resolveGridpoint();
-    }
-
-    if (rainForecastDailyUrl.length() > 0) {
-      WiFiClientSecure dailyClient;
-      dailyClient.setInsecure();
-      HTTPClient dailyHttp;
-      dailyHttp.begin(dailyClient, rainForecastDailyUrl);
-      dailyHttp.setTimeout(20000);
-      dailyHttp.addHeader("User-Agent", NWS_USER_AGENT);
-      dailyHttp.addHeader("Accept", "application/geo+json");
-      int code = dailyHttp.GET();
-
-      if (code == 200) {
-        StaticJsonDocument<160> filter;
-        filter["properties"]["periods"][0]["startTime"] = true;
-        filter["properties"]["periods"][0]["isDaytime"] = true;
-        filter["properties"]["periods"][0]["temperature"] = true;
-
-        DynamicJsonDocument doc(4096);
-        DeserializationError err = deserializeJson(doc, dailyHttp.getStream(),
-                                                     DeserializationOption::Filter(filter));
-        if (!err) {
-          todayHighValid = false;
-          todayLowValid  = false;
-
-          JsonArray periods = doc["properties"]["periods"].as<JsonArray>();
-          for (JsonObject period : periods) {
-            const char* startIso = period["startTime"] | "";
-            char pDate[9];
-            parseNwsIsoTime(startIso, pDate, nullptr);
-            if (strcmp(pDate, todayDate) != 0) break;  // periods are chronological — stop once past today
-
-            bool isDaytime = period["isDaytime"] | false;
-            int  temp      = period["temperature"] | 0;
-            if (isDaytime) {
-              if (!todayHighValid || temp > todayHighTemp) { todayHighTemp = temp; todayHighValid = true; }
-            } else {
-              if (!todayLowValid || temp < todayLowTemp)   { todayLowTemp  = temp; todayLowValid  = true; }
-            }
-          }
-          Serial.printf("Today: high=%s low=%s\n",
-                        todayHighValid ? String(todayHighTemp).c_str() : "n/a",
-                        todayLowValid  ? String(todayLowTemp).c_str()  : "n/a");
-        } else {
-          Serial.printf("NWS daily forecast JSON parse failed: %s\n", err.c_str());
-        }
-      } else {
-        Serial.printf("NWS daily forecast HTTP error: %d\n", code);
-        if (code == 301 || code == 404) rainForecastDailyUrl = "";
-      }
-      dailyHttp.end();
-    }
-  }
-
+  weatherValid     = true;
+  lastWeatherFetch = millis();
   Serial.printf("Weather final: %.1fF feels %.1fF code=%d rain=%d%%\n",
                 currentTemp, feelsLikeTemp, weatherCode, rainChance);
 }
@@ -734,7 +574,7 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
   }
 
   int MAX_BYTES = max(40000, (int)ESP.getMaxAllocHeap() - 20000);
-  if (MAX_BYTES > 300000) MAX_BYTES = 300000;
+  if (MAX_BYTES > 200000) MAX_BYTES = 200000;
   int bufCap = knownLength ? min(len, MAX_BYTES) : MAX_BYTES;
 
   if ((int)ESP.getMaxAllocHeap() < bufCap + 10000) {
@@ -752,11 +592,10 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
 
   WiFiClient *stream = http.getStreamPtr();
   int received = 0;
-  bool hitCap = false;
   unsigned long readStart = millis();
   while (millis() - readStart < 20000) {
     if (knownLength && received >= len) break;
-    if (received >= bufCap) { hitCap = true; break; }
+    if (received >= bufCap) break;
 
     int avail = stream->available();
     if (avail > 0) {
@@ -770,15 +609,8 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
   }
   http.end();
 
-  // For known-length responses, receiving fewer bytes than promised is incomplete.
-  // For unknown-length responses (the common case here — WMS over HTTP/1.0 rarely
-  // sends Content-Length), hitting the buffer cap before the connection closed on
-  // its own means we stopped mid-stream, not at the real end of the image. Treat
-  // that the same as incomplete rather than handing PNGdec a truncated buffer —
-  // that's what was producing "top half fine, garbage below" on larger radar frames.
-  if (received == 0 || (knownLength && received != len) || (!knownLength && hitCap)) {
-    Serial.printf("Incomplete download (%d bytes received, cap=%d, hitCap=%d)\n",
-                  received, bufCap, hitCap);
+  if (received == 0 || (knownLength && received != len)) {
+    Serial.printf("Incomplete download (%d bytes received)\n", received);
     free(buf);
     return false;
   }
@@ -862,76 +694,6 @@ void showRadar() {
   char rangeBuf[24];
   snprintf(rangeBuf, sizeof(rangeBuf), "+/- %d mi", (int)RADAR_RADIUS_MI);
   tft.drawString(rangeBuf, 4, SCREEN_H - 12);
-}
-
-// ── Today's forecast screen ───────────────────────────────────────────────────
-// Reached with a single tap from the radar screen; a tap here returns home.
-void drawForecastScreen() {
-  tft.fillScreen(COL_BG);
-
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(COL_WHITE, COL_BG);
-  tft.setTextSize(2);
-  tft.drawString("TODAY'S FORECAST", SCREEN_W / 2, 8);
-  tft.drawFastHLine(10, 28, SCREEN_W - 20, COL_DIVIDER);
-
-  if (!forecastDataValid) {
-    tft.setTextSize(1);
-    tft.drawString("Fetching...", SCREEN_W / 2, 100);
-    return;
-  }
-
-  char buf[40];
-
-  // High / Low — orange for high, blue for low, twice the previous font size
-  tft.setTextSize(2);
-  tft.setTextDatum(TC_DATUM);
-
-  tft.setTextColor(TFT_ORANGE, COL_BG);
-  if (todayHighValid) snprintf(buf, sizeof(buf), "High %dF", todayHighTemp);
-  else                 snprintf(buf, sizeof(buf), "High --");
-  tft.drawString(buf, SCREEN_W / 4, 32);
-
-  tft.setTextColor(TFT_BLUE, COL_BG);
-  if (todayLowValid) snprintf(buf, sizeof(buf), "Low %dF", todayLowTemp);
-  else                snprintf(buf, sizeof(buf), "Low --");
-  tft.drawString(buf, 3 * SCREEN_W / 4, 32);
-
-  // Rain chance — also doubled in size
-  tft.setTextColor(0x07FF, COL_BG);
-  snprintf(buf, sizeof(buf), "Rain chance: %d%%", todayMaxRainChance);
-  tft.drawString(buf, SCREEN_W / 2, 54);
-
-  if (rainExpectedToday) {
-    tft.setTextColor(COL_FEELS, COL_BG);
-    snprintf(buf, sizeof(buf), "Rain starts ~%s", rainStartTime);
-  } else {
-    tft.setTextColor(COL_HIGH_TIDE, COL_BG);
-    snprintf(buf, sizeof(buf), "No rain expected today");
-  }
-  tft.drawString(buf, SCREEN_W / 2, 78);
-
-  // Hour-by-hour rain chance for the rest of today
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextSize(1);
-  int y = 100;
-  const int rowH = 16;
-  int rows = min(todayForecastCount, MAX_FORECAST_HOURS);
-  for (int i = 0; i < rows; i++) {
-    uint16_t col = todayForecast[i].isRain ? COL_LOW_TIDE : COL_WHITE;
-    tft.setTextColor(col, COL_BG);
-    snprintf(buf, sizeof(buf), "%-7s %3d%%  %s", todayForecast[i].time, todayForecast[i].pop,
-             todayForecast[i].isRain ? "Rain" : "--");
-    tft.drawString(buf, 24, y);
-    y += rowH;
-  }
-
-  // Only worth mentioning the list being empty when rain was actually expected —
-  // on a no-rain day, "No rain expected today" above already says everything needed.
-  if (rows == 0 && rainExpectedToday) {
-    tft.setTextColor(COL_WHITE, COL_BG);
-    tft.drawString("No more hours left today.", 24, y);
-  }
 }
 
 // ── Full redraw ───────────────────────────────────────────────────────────────
@@ -1035,30 +797,17 @@ void loop() {
       if (!screenOn) {
         digitalWrite(BACKLIGHT_PIN, HIGH);
         screenOn = true;
-        if (!radarMode && !forecastMode) drawAll();
+        if (!radarMode) drawAll();
         Serial.println("Screen ON (touch wake)");
       }
 
-      // Tap sequence: home --(double-tap)--> radar --(tap)--> forecast --(tap)--> home
-      if (forecastMode) {
-        // Any tap while viewing the forecast screen returns to the home screen.
-        Serial.println("Tap detected — exiting forecast screen");
-        forecastMode = false;
-        drawAll();
-        lastTapMs = now;
-      } else if (radarMode) {
-        // Any tap while viewing radar moves on to the forecast screen.
-        Serial.println("Tap detected — showing forecast");
-        radarMode      = false;
-        forecastMode   = true;
-        forecastStartMs = now;
-        drawForecastScreen();
-        lastTapMs = now;
-      } else if (gap <= DOUBLE_TAP_WINDOW_MS) {
-        Serial.println("Double-tap detected — showing radar");
-        radarMode    = true;
-        radarStartMs = now;
-        showRadar();
+      if (gap <= DOUBLE_TAP_WINDOW_MS) {
+        if (!radarMode) {
+          Serial.println("Double-tap detected — showing radar");
+          radarMode    = true;
+          radarStartMs = now;
+          showRadar();
+        }
         lastTapMs = 0;  // consume the pair so a 3rd tap doesn't chain into another trigger
       } else {
         lastTapMs = now;
@@ -1075,16 +824,8 @@ void loop() {
     drawAll();
   }
 
-  // --- Forecast screen timeout ---
-  if (forecastMode && (now - forecastStartMs >= FORECAST_DURATION_MS)) {
-    forecastMode = false;
-    lastTouchMs = now;
-    Serial.println("Forecast timeout — returning to normal display");
-    drawAll();
-  }
-
-  // --- Sleep timeout (paused while viewing radar or forecast) ---
-  if (screenOn && !radarMode && !forecastMode && (now - lastTouchMs >= SLEEP_MS)) {
+  // --- Sleep timeout (paused while viewing radar) ---
+  if (screenOn && !radarMode && (now - lastTouchMs >= SLEEP_MS)) {
     digitalWrite(BACKLIGHT_PIN, LOW);
     screenOn = false;
     Serial.println("Screen OFF (sleep)");
@@ -1092,7 +833,7 @@ void loop() {
 
   if (!screenOn) { delay(50); return; }
 
-  if (!radarMode && !forecastMode) {
+  if (!radarMode) {
     if (now - lastSleepCountdownMs >= 60000UL) {
       unsigned long elapsed     = now - lastTouchMs;
       unsigned long remainingMs = (elapsed >= SLEEP_MS) ? 0 : (SLEEP_MS - elapsed);
