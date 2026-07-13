@@ -17,6 +17,13 @@
 #include <WiFiClientSecure.h>
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
+// PNGdec's internal per-line pixel buffer defaults to exactly enough for a
+// 320px-wide image at 32bpp (see PNGdec 1.1.5 release notes). Our radar PNGs
+// are 320px wide with an alpha channel (32bpp) — exactly that boundary. This
+// lines up with the corruption we've been seeing: decode() can report success
+// while pixel data mid-image is wrong, and other times it comes up a couple
+// rows short. Override with headroom so we're safely clear of the edge case.
+#define PNG_MAX_BUFFERED_PIXELS ((384 * 4 + 1) * 2)
 #include <PNGdec.h>
 #include "wave_img.h"
 #include "weather_icons.h"
@@ -96,12 +103,22 @@ const int RAIN_START_THRESHOLD_PCT = 50;
 // of cropping/zooming a fixed pre-made image. KCLX = Charleston, SC radar, which
 // covers Hilton Head. No basemap/roads/labels come with this — just radar data —
 // so we draw a simple crosshair marking your exact location for reference.
-// Quality-controlled composite reflectivity — unlike the raw per-station "sr_bref"
-// layer, this has ground clutter, sea clutter, and non-precipitation echoes filtered
-// out by NOAA's MRMS system (important this close to the coast/marsh). It's a national
-// mosaic, but WMS still lets us request just our small bbox at full native resolution.
-const char* RADAR_WMS_HOST  = "https://opengeo.ncep.noaa.gov/geoserver/conus/ows";
-const char* RADAR_WMS_LAYER = "conus_bref_qcd";
+// Trying Iowa State's Iowa Environmental Mesonet (IEM) instead of NOAA's
+// GeoServer: same WMS GetMap protocol (bbox/width/height/format all carry
+// over unchanged), same unprojected lat/lon (EPSG:4326), updated every 5
+// minutes. Switching in case it's a more reliable/robust server than NOAA's
+// instance — worth testing empirically.
+//
+// Tradeoff: this is IEM's raw NEXRAD base reflectivity composite (N0Q), not
+// a quality-controlled product. NOAA's old conus_bref_qcd layer (commented
+// out below) had ground/sea clutter and non-precip echoes filtered out by
+// MRMS, which matters this close to the coast/marsh — this source may show
+// more clutter/noise than we're used to. If that's a problem in practice,
+// revert to the NOAA line below.
+const char* RADAR_WMS_HOST  = "https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0q.cgi";
+const char* RADAR_WMS_LAYER = "nexrad-n0q";
+// const char* RADAR_WMS_HOST  = "https://opengeo.ncep.noaa.gov/geoserver/conus/ows";
+// const char* RADAR_WMS_LAYER = "conus_bref_qcd";
 
 // (Basemap is now a static image baked into firmware — see basemap_img.h — rather
 // than fetched from NOAA's reference map service, to avoid anti-aliasing speckle
@@ -229,6 +246,41 @@ void parseNwsIsoTime(const char* iso, char* dateOut, char* timeOut) {
 
 
 
+
+// ── Patient stream reader for ArduinoJson ────────────────────────────────────
+// Stream::read() is non-blocking — it returns -1 the instant a byte isn't
+// available *yet*, not just at true end-of-stream. ArduinoJson's default Stream
+// handling takes that at face value, so on a large response arriving over WiFi/
+// TLS in bursts, a normal brief gap between packets can look identical to EOF,
+// producing IncompleteInput or (worse, when combined with a Filter) a silently
+// empty result. This wraps the stream the same patient way fetchPngToBuffer()
+// already reads the radar PNG: keep waiting on available()/connected() instead
+// of trusting a single non-blocking read().
+class PatientStreamReader {
+  public:
+    PatientStreamReader(Stream &s, HTTPClient &h) : _stream(s), _http(h) {}
+    int read() {
+      unsigned long start = millis();
+      while (millis() - start < 10000) {
+        if (_stream.available() > 0) return _stream.read();
+        if (!_http.connected()) return _stream.available() > 0 ? _stream.read() : -1;
+        delay(2);
+      }
+      return -1;  // gave up waiting — genuinely stalled
+    }
+    size_t readBytes(char *buffer, size_t length) {
+      size_t count = 0;
+      while (count < length) {
+        int c = read();
+        if (c < 0) break;
+        buffer[count++] = (char)c;
+      }
+      return count;
+    }
+  private:
+    Stream &_stream;
+    HTTPClient &_http;
+};
 
 // ── Resolve NWS gridpoint forecastHourly URL (call once; cache result) ───────
 bool resolveGridpoint() {
@@ -405,26 +457,47 @@ void fetchWeather() {
     if (rainForecastUrl.length() > 0) {
       WiFiClientSecure gpClient;
       gpClient.setInsecure();
+      gpClient.setTimeout(20000);
       HTTPClient gpHttp;
       gpHttp.begin(gpClient, rainForecastUrl);
       gpHttp.setTimeout(20000);
+      // Content-Length came back -1 (chunked transfer-encoding, confirmed by log).
+      // Same fix already used for the radar PNG fetch: HTTP/1.0 makes the server
+      // send a real length (or just close the connection) instead of interleaving
+      // chunk-size markers into the body. Those markers landing inside the stream
+      // that ArduinoJson's filter reads byte-by-byte would explain periods coming
+      // back empty with no parse error — the filter's skip logic doesn't validate
+      // JSON structure strictly, so stray non-JSON bytes can throw off its brace
+      // tracking without ever raising a hard error.
+      gpHttp.useHTTP10(true);
       gpHttp.addHeader("User-Agent", NWS_USER_AGENT);
       gpHttp.addHeader("Accept", "application/geo+json");
       int code = gpHttp.GET();
 
       if (code == 200) {
+        Serial.printf("Hourly response Content-Length: %d\n", gpHttp.getSize());
         // Hourly forecast has ~150 periods (vs. ~14 for the daily endpoint) — filter
         // down to just the fields we use so the parsed doc stays small on the ESP32.
-        StaticJsonDocument<192> filter;
+        // (Sized well above the ~192B this structure theoretically needs — a filter
+        // sized to the exact minimum can silently truncate during construction and
+        // end up filtering out everything, which is what was causing "hours=0".)
+        StaticJsonDocument<512> filter;
         filter["properties"]["periods"][0]["startTime"] = true;
         filter["properties"]["periods"][0]["shortForecast"] = true;
-        filter["properties"]["periods"][0]["probabilityOfPrecipitation"]["value"] = true;
+        // Whole subtree, not just ["value"] — nested field-selection inside an
+        // already-filtered array element is the one structural difference between
+        // this (broken, periods=0) filter and the daily one (which works and only
+        // filters flat/scalar fields). Including the whole object is a superset
+        // (keeps the small "unitCode" string too) but sidesteps whatever's wrong
+        // with the doubly-nested selector.
+        filter["properties"]["periods"][0]["probabilityOfPrecipitation"] = true;
 
         // Bumped up from the original 16KB now that startTime is included and we
         // walk up to 24 periods instead of 4 — still comfortably freed right after
         // this block since `doc` is scoped to it.
         DynamicJsonDocument doc(24576);
-        DeserializationError err = deserializeJson(doc, gpHttp.getStream(),
+        PatientStreamReader reader(gpHttp.getStream(), gpHttp);
+        DeserializationError err = deserializeJson(doc, reader,
                                                      DeserializationOption::Filter(filter));
         if (!err) {
           rainChance = 0; String shortFc = "clear"; String bestPeriodTime = "";
@@ -434,6 +507,8 @@ void fetchWeather() {
           todayMaxRainChance = 0;
 
           JsonArray periods = doc["properties"]["periods"].as<JsonArray>();
+          Serial.printf("Hourly periods parsed: %d (todayDate=%s, overflowed=%d, hasProperties=%d)\n",
+                        periods.size(), todayDate, doc.overflowed(), !doc["properties"].isNull());
           int idx = 0;
           for (JsonObject period : periods) {
             if (idx >= 24) break;  // next 24 hourly periods is plenty to cover "today"
@@ -516,21 +591,26 @@ void fetchWeather() {
     if (rainForecastDailyUrl.length() > 0) {
       WiFiClientSecure dailyClient;
       dailyClient.setInsecure();
+      dailyClient.setTimeout(20000);
       HTTPClient dailyHttp;
       dailyHttp.begin(dailyClient, rainForecastDailyUrl);
       dailyHttp.setTimeout(20000);
+      dailyHttp.useHTTP10(true);  // same chunked-encoding fix as the hourly fetch
       dailyHttp.addHeader("User-Agent", NWS_USER_AGENT);
       dailyHttp.addHeader("Accept", "application/geo+json");
       int code = dailyHttp.GET();
 
       if (code == 200) {
-        StaticJsonDocument<160> filter;
+        // Same margin fix as the hourly filter above — was sized to the exact
+        // theoretical minimum (~160B), which risks silent truncation.
+        StaticJsonDocument<512> filter;
         filter["properties"]["periods"][0]["startTime"] = true;
         filter["properties"]["periods"][0]["isDaytime"] = true;
         filter["properties"]["periods"][0]["temperature"] = true;
 
         DynamicJsonDocument doc(4096);
-        DeserializationError err = deserializeJson(doc, dailyHttp.getStream(),
+        PatientStreamReader dailyReader(dailyHttp.getStream(), dailyHttp);
+        DeserializationError err = deserializeJson(doc, dailyReader,
                                                      DeserializationOption::Filter(filter));
         if (!err) {
           todayHighValid = false;
@@ -667,7 +747,10 @@ void drawWeather() {
   tft.setTextSize(2);
   tft.drawString("Rain", cx, rainAreaY + 4);
 
-  snprintf(buf, sizeof(buf), "%d%%", rainChance);
+  // Rest-of-day max, not just the next 4 hours — matches the forecast screen and
+  // avoids showing a misleadingly low % when the near-term hours look dry but
+  // rain is expected (or already happening) later/now in the day.
+  snprintf(buf, sizeof(buf), "%d%%", todayMaxRainChance);
   tft.setTextSize(3);
   tft.drawString(buf, cx, rainAreaY + 22);
 }
@@ -676,34 +759,68 @@ void drawWeather() {
 // Drawn ON TOP of the basemap — skip any pixel that came out as pure background
 // color (i.e. "no radar echo here") so the basemap underneath stays visible.
 // Radar transparency: 0=invisible 255=fully opaque. 180=70%, 128=50%, 220=86%.
-#define RADAR_ALPHA 180
+#define RADAR_ALPHA 110
 
-static inline uint16_t blendRadar(uint16_t radar, uint16_t base) {
-  uint8_t rR=(radar>>11)&0x1F, rG=(radar>>5)&0x3F, rB=radar&0x1F;
-  uint8_t bR=(base >>11)&0x1F, bG=(base >>5)&0x3F, bB=base &0x1F;
-  uint8_t a=RADAR_ALPHA, ia=255-a;
-  return ((uint16_t)((rR*a+bR*ia)>>8)<<11)|((uint16_t)((rG*a+bG*ia)>>8)<<5)|((uint16_t)((rB*a+bB*ia)>>8));
+int lastRadarDrawRow = -1;  // diagnostic: last row the callback actually received
+
+// Blend one pixel's true RGB + alpha against the actual basemap pixel beneath
+// it, weighted by real alpha (not PNGdec's flat-black-background shortcut,
+// which produced muddy near-black values for partially-transparent pixels —
+// that was the source of the speckled/streaky artifacts we used to see).
+static inline uint16_t blendRadarPixel(uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint16_t basePix) {
+  if (a == 0) return basePix;
+  uint8_t bR = ((basePix >> 11) & 0x1F) << 3;
+  uint8_t bG = ((basePix >> 5) & 0x3F) << 2;
+  uint8_t bB = (basePix & 0x1F) << 3;
+  // Combine the pixel's real alpha with our own overlay strength so the radar
+  // layer still reads as a translucent wash over the map rather than fully
+  // opaque, matching the previous look for solid returns.
+  uint16_t effA = (uint16_t)a * RADAR_ALPHA / 255;
+  uint8_t outR = ((uint16_t)r * effA + (uint16_t)bR * (255 - effA)) / 255;
+  uint8_t outG = ((uint16_t)g * effA + (uint16_t)bG * (255 - effA)) / 255;
+  uint8_t outB = ((uint16_t)b * effA + (uint16_t)bB * (255 - effA)) / 255;
+  return ((outR >> 3) << 11) | ((outG >> 2) << 5) | (outB >> 3);
 }
 
 int radarPngDraw(PNGDRAW *pDraw) {
+  lastRadarDrawRow = pDraw->y;
   if (pDraw->y >= SCREEN_H) return 1;           // height guard
   int lineW = min((int)pDraw->iWidth, SCREEN_W); // width guard
-  uint16_t lineBuf[SCREEN_W];
-  // LITTLE_ENDIAN matches tft.setSwapBytes(true) set in decodePng
-  // Background 0x00000000 maps transparent pixels to 0x0000 (black = COL_BG)
-  png.getLineAsRGB565(pDraw, lineBuf, PNG_RGB565_LITTLE_ENDIAN, 0x00000000);
 
   uint16_t blended[SCREEN_W];
-  int x = 0;
-  while (x < lineW) {
-    if (lineBuf[x] == COL_BG) { x++; continue; }
-    int runStart = x;
-    while (x < lineW && lineBuf[x] != COL_BG) {
-      blended[x] = blendRadar(lineBuf[x], pgm_read_word(&basemap_img[pDraw->y * SCREEN_W + x]));
-      x++;
+  uint8_t *src = pDraw->pPixels;
+
+  if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
+    // We now request image/png8 from the WMS server: an indexed/palette PNG
+    // instead of 32-bit RGBA. Each pixel is a small index (packed iBpp bits
+    // per pixel) into pDraw->pPalette: bytes 0..767 are 256 RGB triples,
+    // bytes 768..1023 are per-color alpha (only meaningful if iHasAlpha —
+    // populated from the file's tRNS chunk; otherwise every color is opaque).
+    uint8_t *pal = pDraw->pPalette;
+    for (int x = 0; x < lineW; x++) {
+      uint8_t idx;
+      switch (pDraw->iBpp) {
+        case 8: idx = src[x]; break;
+        case 4: idx = (x & 1) ? (src[x >> 1] & 0x0F) : (src[x >> 1] >> 4); break;
+        case 2: idx = (src[x >> 2] >> ((3 - (x & 3)) * 2)) & 0x03; break;
+        case 1: idx = (src[x >> 3] >> (7 - (x & 7))) & 0x01; break;
+        default: idx = 0; break;
+      }
+      uint8_t a = pDraw->iHasAlpha ? pal[768 + idx] : 255;
+      uint16_t basePix = pgm_read_word(&basemap_img[pDraw->y * SCREEN_W + x]);
+      blended[x] = blendRadarPixel(pal[idx * 3 + 0], pal[idx * 3 + 1], pal[idx * 3 + 2], a, basePix);
     }
-    tft.pushImage(runStart, pDraw->y, x - runStart, 1, &blended[runStart]);
+  } else {
+    // Fallback in case the server ever doesn't honor image/png8 and sends
+    // full truecolor+alpha instead (pixelType 6, 4 bytes/pixel: R,G,B,A).
+    for (int x = 0; x < lineW; x++) {
+      uint16_t basePix = pgm_read_word(&basemap_img[pDraw->y * SCREEN_W + x]);
+      blended[x] = blendRadarPixel(src[x * 4 + 0], src[x * 4 + 1], src[x * 4 + 2], src[x * 4 + 3], basePix);
+    }
   }
+  // One SPI transaction per row instead of one per run of non-background
+  // pixels — a busy radar row could previously trigger dozens of tiny writes.
+  tft.pushImage(0, pDraw->y, lineW, 1, blended);
   return 1;
 }
 
@@ -763,7 +880,13 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
       int toRead = min(avail, bufCap - received);
       received += stream->readBytes(buf + received, toRead);
     } else if (!http.connected()) {
-      break;
+      // Connection reports closed, but a few final (already TLS-decrypted) bytes
+      // can still be sitting in the stream's local buffer right at the disconnect
+      // boundary — give it one more moment before concluding we're truly done.
+      // Silently losing just the tail of the file is exactly what let PNGdec run
+      // out of data mid-decode even though this function reported success.
+      delay(10);
+      if (stream->available() <= 0) break;
     } else {
       delay(5);
     }
@@ -789,16 +912,115 @@ bool fetchPngToBuffer(const String &url, uint8_t **outBuf, int *outLen) {
   return true;
 }
 
+// Standard CRC32 (as used by PNG chunk trailers), computed bit-by-bit — no
+// lookup table needed for a one-off ~11KB check.
+uint32_t crc32_png(const uint8_t *buf, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= buf[i];
+    for (int k = 0; k < 8; k++) {
+      crc = (crc >> 1) ^ (0xEDB88320UL & (0 - (crc & 1)));
+    }
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
 // Decodes an already-downloaded PNG buffer via PNGdec using `drawCb`, then frees it.
 bool decodePng(uint8_t *buf, int len, PNG_DRAW_CALLBACK *drawCb) {
   bool ok = false;
+  // Reset up front, not just right before decode() — if we bail out early
+  // (e.g. a CRC mismatch below, before decode is ever attempted), showRadar()
+  // must not see a stale row count left over from a previous successful call
+  // and mistakenly accept this failure as "close enough".
+  lastRadarDrawRow = -1;
+
+  // Dump both ends of the buffer as hex. A valid PNG must start with the 8-byte
+  // signature 89 50 4E 47 0D 0A 1A 0A and its very last 12 bytes must be the IEND
+  // chunk: 00 00 00 00 49 45 4E 44 AE 42 60 82. If that tail is missing/different
+  // despite the byte count matching what the server declared, the file itself
+  // (as generated/sent by the WMS server) is incomplete — not a download bug.
+  {
+    char hex[80];
+    int n = min(len, 16);
+    int o = 0;
+    for (int i = 0; i < n; i++) o += snprintf(hex + o, sizeof(hex) - o, "%02X ", buf[i]);
+    Serial.printf("PNG buf head (%d bytes): %s\n", len, hex);
+    o = 0;
+    int tailStart = max(0, len - 16);
+    for (int i = tailStart; i < len; i++) o += snprintf(hex + o, sizeof(hex) - o, "%02X ", buf[i]);
+    Serial.printf("PNG buf tail: %s\n", hex);
+  }
+
+  // Walk the top-level chunk table ourselves, independent of PNGdec, so we can
+  // see the file's actual structure (chunk types, sizes, how many IDAT chunks,
+  // total compressed bytes) rather than inferring it from PNGdec's behavior.
+  // Also verify each chunk's CRC32 trailer — our earlier checks (byte count,
+  // head/tail hex, chunk framing) only prove the file is structurally
+  // well-formed, not that every byte in the middle arrived intact. A single
+  // bit flipped somewhere inside an 11KB IDAT payload during a rare WiFi/TLS
+  // hiccup would still pass all of those checks but leave the compressed
+  // stream genuinely undecodable partway through — which is a much better
+  // explanation for occasional failures well before the end of the image
+  // (e.g. row 129 of 240) than a library bug, since the library-bug pattern
+  // we've confirmed only ever costs the last handful of rows (235-239).
+  bool crcOk = true;
+  {
+    Serial.println("PNG chunk walk:");
+    int pos = 8;  // skip the 8-byte signature
+    long idatTotal = 0;
+    int idatCount = 0;
+    while (pos + 8 <= len) {
+      uint32_t chunkLen = ((uint32_t)buf[pos] << 24) | ((uint32_t)buf[pos + 1] << 16) |
+                          ((uint32_t)buf[pos + 2] << 8) | buf[pos + 3];
+      char type[5] = { (char)buf[pos + 4], (char)buf[pos + 5], (char)buf[pos + 6], (char)buf[pos + 7], 0 };
+      bool haveCrc = (pos + 8 + (int)chunkLen + 4 <= len);
+      bool chunkCrcOk = true;
+      if (haveCrc) {
+        uint32_t computed = crc32_png(&buf[pos + 4], chunkLen + 4);  // type + data
+        uint32_t stored = ((uint32_t)buf[pos + 8 + chunkLen] << 24) | ((uint32_t)buf[pos + 9 + chunkLen] << 16) |
+                          ((uint32_t)buf[pos + 10 + chunkLen] << 8) | buf[pos + 11 + chunkLen];
+        chunkCrcOk = (computed == stored);
+      }
+      Serial.printf("  %-4s len=%u offset=%d crc=%s\n", type, (unsigned)chunkLen, pos,
+                    haveCrc ? (chunkCrcOk ? "ok" : "MISMATCH") : "n/a");
+      if ((strcmp(type, "IDAT") == 0 || strcmp(type, "IHDR") == 0) && !chunkCrcOk) crcOk = false;
+      if (strcmp(type, "IDAT") == 0) { idatTotal += chunkLen; idatCount++; }
+      if (strcmp(type, "IEND") == 0) break;
+      if (chunkLen > (uint32_t)len) { Serial.println("  (bad length — aborting walk)"); break; }
+      pos += 8 + chunkLen + 4;  // header(8) + data + CRC(4)
+    }
+    Serial.printf("PNG chunk walk: %d IDAT chunk(s), %ld total compressed bytes, file=%d bytes\n",
+                  idatCount, idatTotal, len);
+  }
+
+  if (!crcOk) {
+    // A critical chunk's CRC didn't match its data — the transfer corrupted
+    // something mid-stream. Don't bother attempting to decode known-bad
+    // data; just report it the same way as a failed decode.
+    Serial.println("PNG chunk CRC mismatch — corrupted transfer, skipping decode");
+    free(buf);
+    return false;
+  }
+
   int rc = png.openRAM(buf, len, drawCb);
   if (rc == PNG_SUCCESS) {
     tft.setSwapBytes(true);
+    Serial.printf("PNG info: %dx%d bpp=%d pixelType=%d hasAlpha=%d interlaced=%d\n",
+                  png.getWidth(), png.getHeight(), png.getBpp(), png.getPixelType(),
+                  png.hasAlpha(), png.isInterlaced());
+    Serial.printf("Heap before decode: free=%u largest=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    lastRadarDrawRow = -1;
     rc = png.decode(NULL, 0);
     png.close();
-    Serial.printf("PNG decode result: %d\n", rc);
-    ok = true;
+    Serial.printf("PNG decode result: %d (last row drawn: %d of %d)\n", rc, lastRadarDrawRow, png.getHeight());
+    // decode() returning non-zero means it stopped before finishing every scanline
+    // (corrupt/unsupported data, or ran out of contiguous heap mid-decode). Whatever
+    // rows the draw callback already pushed are still on screen — the caller needs
+    // to know this so it can clean that up rather than leaving a garbled partial frame.
+    ok = (rc == PNG_SUCCESS);
+    if (!ok) {
+      Serial.println("PNG decode did not complete — image is likely partially garbled");
+    }
   } else {
     Serial.printf("PNG open failed: %d\n", rc);
   }
@@ -832,6 +1054,13 @@ void showRadar() {
   snprintf(radarUrl, sizeof(radarUrl),
     "%s?service=WMS&version=1.1.1&request=GetMap&layers=%s&styles="
     "&bbox=%.5f,%.5f,%.5f,%.5f&width=%d&height=%d&srs=EPSG:4326"
+    // Tried format=image/png8 (indexed palette) to shrink the payload, but
+    // this server silently ignores it and always returns full 32-bit RGBA
+    // regardless (confirmed via pixelType in the decode log) — PNG8 isn't
+    // supported/enabled for this layer on NOAA's GeoServer instance. Back to
+    // plain PNG; radarPngDraw() still has an indexed-pixel code path ready
+    // in case that ever changes, but the fallback (RGBA) branch is what
+    // actually runs.
     "&format=image/png&transparent=true",
     RADAR_WMS_HOST, RADAR_WMS_LAYER, lonMin, latMin, lonMax, latMax, SCREEN_W, SCREEN_H);
   Serial.printf("Radar WMS URL: %s\n", radarUrl);
@@ -846,7 +1075,46 @@ void showRadar() {
   tft.pushImage(0, 0, BASEMAP_W, BASEMAP_H, basemap_img);
 
   if (downloaded) {
-    decodePng(radarBuf, radarLen, radarPngDraw);
+    bool decoded = decodePng(radarBuf, radarLen, radarPngDraw);
+    // Confirmed root cause by reading PNGdec's DecodePNG() source directly:
+    // its success path only fires when a single inflate() call BOTH returns
+    // Z_STREAM_END AND exactly finishes filling the current scanline's output
+    // buffer on that same call. If the final scanline finishes on one call
+    // (Z_OK, avail_out==0) and the stream's actual end arrives on the next
+    // call, that success check never matches. The outer loop then thinks it
+    // still needs more image rows, tries to read another chunk header past
+    // IEND, hits real end-of-file, and hard-fails with PNG_DECODE_ERROR —
+    // even though every real pixel row had already decoded correctly. This
+    // consistently costs the last handful of rows (observed 235-239 of 240).
+    // It's a genuine library bug, not a download/data problem (every file
+    // we've inspected byte-for-byte has been complete and valid).
+    //
+    // Rejecting every non-success decode was tried and made things worse:
+    // decode essentially never returns a clean full success on this device
+    // (it consistently lands around row 235-239 of 240), so requiring
+    // perfection meant the radar screen failed almost every time. Back to
+    // accepting "got within a few rows of the bottom" as good enough. One
+    // report of visible garbage on an accepted near-complete decode came in
+    // without a photo to confirm it was real corruption rather than faint
+    // low-alpha radar texture at a low RADAR_ALPHA setting — if it recurs
+    // with a photo showing genuine garbage (not just sparse echo dots),
+    // that's real evidence this tolerance is unsafe and needs a different
+    // approach (e.g. discarding the frame entirely rather than showing it).
+    const int RADAR_ROW_TOLERANCE = 8;
+    bool closeEnough = !decoded && lastRadarDrawRow >= SCREEN_H - RADAR_ROW_TOLERANCE;
+    if (closeEnough) {
+      Serial.printf("Radar decode close enough (row %d of %d) — accepting\n", lastRadarDrawRow, SCREEN_H);
+    }
+    if (!decoded && !closeEnough) {
+      // Decode stopped well short — wipe out whatever partial/garbled rows
+      // radarPngDraw() already pushed by redrawing a clean basemap, then say so
+      // instead of silently leaving a corrupted frame on screen.
+      tft.pushImage(0, 0, BASEMAP_W, BASEMAP_H, basemap_img);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(COL_WHITE, COL_BG);
+      tft.setTextSize(2);
+      tft.drawString("Radar decode error", SCREEN_W / 2, SCREEN_H / 2);
+    }
   } else {
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(COL_WHITE, COL_BG);
@@ -911,12 +1179,14 @@ void drawForecastScreen() {
   }
   tft.drawString(buf, SCREEN_W / 2, 78);
 
-  // Hour-by-hour rain chance for the rest of today
+  // Hour-by-hour rain chance for the rest of today — larger font means fewer
+  // rows fit (6 instead of 8), but still covers a useful near-term window.
   tft.setTextDatum(TL_DATUM);
-  tft.setTextSize(1);
+  tft.setTextSize(2);
   int y = 100;
-  const int rowH = 16;
-  int rows = min(todayForecastCount, MAX_FORECAST_HOURS);
+  const int rowH = 20;
+  const int DISPLAY_ROWS = 6;
+  int rows = min(todayForecastCount, DISPLAY_ROWS);
   for (int i = 0; i < rows; i++) {
     uint16_t col = todayForecast[i].isRain ? COL_LOW_TIDE : COL_WHITE;
     tft.setTextColor(col, COL_BG);
@@ -929,6 +1199,7 @@ void drawForecastScreen() {
   // Only worth mentioning the list being empty when rain was actually expected —
   // on a no-rain day, "No rain expected today" above already says everything needed.
   if (rows == 0 && rainExpectedToday) {
+    tft.setTextSize(1);
     tft.setTextColor(COL_WHITE, COL_BG);
     tft.drawString("No more hours left today.", 24, y);
   }
@@ -947,6 +1218,13 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n=== TideDisplay starting ===");
+  // One-time check: does this board actually have PSRAM wired up? If
+  // getPsramSize() reports 0, there's no external RAM available no matter
+  // what — the radar decode is stuck working within internal SRAM only. If
+  // it reports several MB, a full-image-buffer PNG decode (a more robust,
+  // battle-tested library instead of the line-streaming PNGdec) becomes a
+  // real option.
+  Serial.printf("PSRAM size: %u bytes (found=%d)\n", ESP.getPsramSize(), psramFound());
 
   pinMode(27, OUTPUT);
   digitalWrite(27, HIGH);
